@@ -270,7 +270,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
 
 
 def main():
-    device = 'cuda'
+    device = 'cuda:2'
 
     model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)

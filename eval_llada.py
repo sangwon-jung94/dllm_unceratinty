@@ -1,6 +1,8 @@
 '''
 This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import accelerate
 import torch
 import re

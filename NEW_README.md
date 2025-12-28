@@ -55,6 +55,35 @@ and unmask the top \(m_s\) positions by score at step \(s\).
 
 ---
 
+## Quick Start
+
+### 1. Installation
+```bash
+pip install -r requirements.txt  # PyTorch, transformers, datasets, etc.
+```
+
+### 2. Running GSM8K Benchmark
+```bash
+# Run a single experiment
+./scripts/run_gsm8k.sh
+
+# Run all comparison experiments
+./scripts/run_all_benchmarks.sh
+```
+
+### 3. Evaluating Results
+```bash
+# Evaluate all GSM8K results
+./scripts/evaluate_all_results.sh
+
+# Compare results
+python3 compare_results.py --show_errors --show_common
+```
+
+For detailed evaluation guide, see [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md)
+
+---
+
 ## MC Dropout in LLaDA-style decoding
 
 LLaDA-style inference typically runs with `model.eval()` (dropout OFF).  

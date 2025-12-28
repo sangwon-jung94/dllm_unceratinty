@@ -1,6 +1,8 @@
 """
 Debug script for uncertainty_aware remasking issue
 """
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
