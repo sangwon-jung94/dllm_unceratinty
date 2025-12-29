@@ -16,6 +16,8 @@ import os
 from datetime import datetime
 from datasets import load_dataset
 
+from tqdm import tqdm
+
 
 @torch.no_grad()
 def generate_with_uncertainty_tracking(
@@ -84,8 +86,8 @@ def generate_with_uncertainty_tracking(
     for num_block in range(num_blocks):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
-        
-        for i in range(steps_per_block):
+
+        for i in tqdm(range(steps_per_block), desc=f"Block {num_block+1}/{num_blocks} steps", leave=False):
             mask_index = (x == mask_id)
             
             # Compute uncertainty decomposition with MC Dropout (for uncertainty estimation only)
@@ -482,17 +484,19 @@ def main():
         all_outputs = []
         all_uncertainty_histories = []
         
-        for batch_idx in range(0, len(all_prompts), args.batch_size):
+        num_batches = (len(all_prompts) + args.batch_size - 1) // args.batch_size
+        for batch_idx in tqdm(range(0, len(all_prompts), args.batch_size), desc="Batch", total=num_batches):
             batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
-            print(f"\nProcessing batch {batch_idx // args.batch_size + 1}/{(len(all_prompts) + args.batch_size - 1) // args.batch_size} ({len(batch_prompts)} samples)...")
-            
+            # tqdm 내부에서 별도 print는 생략
+            # print(f"\nProcessing batch {batch_idx // args.batch_size + 1}/{num_batches} ({len(batch_prompts)} samples)...")
+
             # Apply chat template if using Instruct model
             messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
             formatted_prompts = [
                 tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
                 for message in messages
             ]
-            
+
             encoded_outputs = tokenizer(
                 formatted_prompts,
                 add_special_tokens=False,
@@ -501,7 +505,7 @@ def main():
             )
             input_ids = encoded_outputs['input_ids'].to(device)
             attention_mask = encoded_outputs['attention_mask'].to(device)
-            
+
             # Generate with uncertainty tracking
             out, uncertainty_history = generate_with_uncertainty_tracking(
                 model=model,
@@ -521,7 +525,7 @@ def main():
                 dropout_p=args.dropout_p,
                 use_mc_dropout_logit=args.use_mc_dropout_logit
             )
-            
+
             # Decode output for this batch
             batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
             all_outputs.extend(batch_output)

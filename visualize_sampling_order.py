@@ -369,7 +369,7 @@ def main():
     
     # 캐시/출력 경로 설정 (NAS I/O 회피)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cache_dir = args.cache_dir if args.cache_dir else os.environ.get('TRANSFORMERS_CACHE', '/tmp/hf_cache')
+    cache_dir = args.cache_dir if args.cache_dir else os.environ.get('TRANSFORMERS_CACHE', '/workspace/hf_cache')
     os.makedirs(cache_dir, exist_ok=True)
 
     # 모델 로딩
