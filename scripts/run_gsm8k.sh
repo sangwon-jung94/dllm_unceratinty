@@ -13,7 +13,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --gen_length 512 \
     --block_length 512 \
     --remasking uncertainty_aware \
-    --mc_samples 4  --alpha 1.0 --beta 1.0 \
+    --mc_samples 4  --alpha 1.0 --beta 1.0  --dropout_p 0.2 \
     --use_mc_dropout_logit \
     --device cuda:1 \
     --output_dir ./result \
