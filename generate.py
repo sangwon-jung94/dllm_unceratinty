@@ -43,31 +43,29 @@ def get_num_transfer_tokens(mask_index, steps):
 
 
 def enable_mc_dropout(model, p=None):
-    """
-    Enable dropout layers for MC Dropout inference while keeping other layers in eval mode.
-
-    Args:
-        model: The model to enable dropout on.
-        p: Dropout probability. If None, uses the existing probability in each layer.
-
-    Returns:
-        int: Number of dropout layers found and enabled
-    """
+    """MC Dropout을 위해 dropout 레이어 활성화"""
     dropout_count = 0
-    for m in model.modules():
-        if isinstance(m, nn.Dropout):
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Dropout) and not name.endswith("emb_drop"):
             if p is not None:
                 m.p = p
             m.train()
             dropout_count += 1
+        # if m.__class__.__name__ == "LLaDALlamaBlock":
+        #     m.config.attention_dropout = p if p is not None else m.config.attention_dropout
+        #     m.train()
+        #     dropout_count += 1
     return dropout_count
 
 
 def disable_mc_dropout(model):
-    """Disable dropout layers, returning them to eval mode."""
+    """Dropout 레이어 비활성화"""
     for m in model.modules():
         if isinstance(m, nn.Dropout):
             m.eval()
+        if m.__class__.__name__ == "LLaDALlamaBlock":
+            m.eval()
+            m.config.attention_dropout = 0.
 
 
 def compute_entropy(probs, dim=-1, eps=1e-9):

@@ -5,7 +5,6 @@
 # Record start and end time
 start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
-    --model_path GSAI-ML/LLaDA-8B-Base \
     --use_prompt \
     --benchmark gsm8k \
     --batch_size 32 \
@@ -16,7 +15,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --remasking uncertainty_aware \
     --mc_samples 4  --alpha 1.0 --beta 1.0 \
     --use_mc_dropout_logit \
-    --device cuda:0 \
+    --device cuda:3 \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty_aware
 end_time=$(date +%s)
