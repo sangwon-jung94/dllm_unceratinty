@@ -215,7 +215,6 @@ def generate_with_tracking(model, prompt, tokenizer, attention_mask=None, steps=
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
-                    enable_mc_dropout(model, p=dropout_p)
                     if attention_mask is not None:
                         logits = model(x, attention_mask=attention_mask).logits
                     else:
