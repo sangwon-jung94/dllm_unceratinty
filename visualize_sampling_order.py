@@ -4,7 +4,6 @@ LLaDA 모델의 샘플링 순서 시각화 스크립트
 각 스텝별로 생성되는 시퀀스를 추적합니다.
 """
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import warnings
@@ -12,113 +11,14 @@ from transformers import AutoTokenizer, AutoModel
 from datetime import datetime
 import os
 
-
-def add_gumbel_noise(logits, temperature):
-    if temperature == 0:
-        return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
-    gumbel_noise = (- torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
-
-
-def get_num_transfer_tokens(mask_index, steps):
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-    base = mask_num // steps
-    remainder = mask_num % steps
-    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, :remainder[i]] += 1
-    return num_transfer_tokens
-
-
-def enable_mc_dropout(model, p=None):
-    """MC Dropout을 위해 dropout 레이어 활성화"""
-    dropout_count = 0
-    for name, m in model.named_modules():
-        if isinstance(m, nn.Dropout) and not name.endswith("emb_drop"):
-            if p is not None:
-                m.p = p
-            m.train()
-            dropout_count += 1
-        # if m.__class__.__name__ == "LLaDALlamaBlock":
-        #     print(f"Enabling MC Dropout in {name}, setting attention_dropout to {p if p is not None else m.config.attention_dropout}")
-        #     m.config.attention_dropout = p if p is not None else m.config.attention_dropout
-        #     m.train()
-        #     dropout_count += 1
-    return dropout_count
-
-
-def disable_mc_dropout(model):
-    """Dropout 레이어 비활성화"""
-    for m in model.modules():
-        if isinstance(m, nn.Dropout):
-            m.eval()
-        if m.__class__.__name__ == "LLaDALlamaBlock":
-            m.eval()
-            m.config.attention_dropout = 0.
-    
-
-
-def compute_entropy(probs, dim=-1, eps=1e-9):
-    """엔트로피 계산: H(p) = -sum(p * log(p))"""
-    return (-probs * probs.clamp_min(eps).log()).sum(dim=dim)
-
-
-def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_scale, prompt_index, mask_id, dropout_p=None):
-    """MC Dropout을 통한 epistemic/aleatoric 불확실성 분해"""
-    probs_sum = None
-    entropy_sum = None
-    logits_sum = None
-
-    dropout_count = enable_mc_dropout(model, p=dropout_p)
-
-    try:
-        for k in range(mc_samples):
-            if cfg_scale > 0.:
-                un_x = x.clone()
-                un_x[prompt_index] = mask_id
-                x_ = torch.cat([x, un_x], dim=0)
-                if attention_mask is not None:
-                    attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
-                    logits = model(x_, attention_mask=attention_mask_).logits
-                else:
-                    logits = model(x_).logits
-                logits, un_logits = torch.chunk(logits, 2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-            else:
-                if attention_mask is not None:
-                    logits = model(x, attention_mask=attention_mask).logits
-                else:
-                    logits = model(x).logits
-
-            p = F.softmax(logits, dim=-1)
-            h_k = compute_entropy(p, dim=-1)
-
-            if probs_sum is None:
-                probs_sum = p.clone()
-                entropy_sum = h_k.clone()
-                logits_sum = logits.clone()
-            else:
-                probs_sum = probs_sum + p
-                entropy_sum = entropy_sum + h_k
-                logits_sum = logits_sum + logits
-
-    finally:
-        disable_mc_dropout(model)
-
-    p_bar = probs_sum / mc_samples
-    mean_logits = logits_sum / mc_samples
-    H_total = compute_entropy(p_bar, dim=-1)
-    H_aleatoric = entropy_sum / mc_samples
-    H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)
-
-    return mean_logits, H_epistemic, H_aleatoric, p_bar
-
-
-def compute_uncertainty_score(epistemic, aleatoric, alpha, beta):
-    """불확실성 점수 계산: 높은 점수 = 낮은 불확실성 = 먼저 언마스킹"""
-    return -alpha * epistemic - beta * aleatoric
+# generate.py에서 공통 함수들 import
+from generate import (
+    add_gumbel_noise,
+    get_num_transfer_tokens,
+    compute_entropy,
+    compute_uncertainty_decomposition,
+    compute_uncertainty_score
+)
 
 
 @torch.no_grad()
@@ -126,8 +26,8 @@ def generate_with_tracking(model, prompt, tokenizer, attention_mask=None, steps=
                           block_length=128, temperature=0., cfg_scale=0., remasking='low_confidence', 
                           mask_id=126336, logits_eos_inf=False, confidence_eos_eot_inf=False,
                           mc_samples=8, alpha=1.0, beta=1.0, dropout_p=None):
-    '''
-    각 스텝의 시퀀스 상태를 추적하면서 생성
+    """
+    generate.py의 generate 함수와 동일하지만, 각 스텝의 시퀀스 히스토리를 추적합니다.
     
     Args:
         mc_samples: MC Dropout 샘플 수 (uncertainty_aware 모드에서만 사용)
@@ -136,9 +36,13 @@ def generate_with_tracking(model, prompt, tokenizer, attention_mask=None, steps=
         dropout_p: Dropout 확률 (None이면 기존 레이어 확률 사용)
         logits_eos_inf: EOS 토큰 logits를 -inf로 설정하여 조기 종료 방지
         confidence_eos_eot_inf: EOS/EoT 토큰의 confidence를 -inf로 설정
-    '''
+    
+    Returns:
+        (generated_sequence, sequence_history): 생성된 시퀀스와 각 스텝의 히스토리
+    """
     # Dropout 체크
     if remasking == 'uncertainty_aware':
+        import torch.nn as nn
         dropout_count = sum(1 for m in model.modules() if isinstance(m, nn.Dropout))
         if dropout_count == 0:
             warnings.warn(
@@ -150,7 +54,7 @@ def generate_with_tracking(model, prompt, tokenizer, attention_mask=None, steps=
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
     
-    # 각 스텝에서의 시퀀스 상태 저장
+    # 각 스텝에서의 시퀀스 상태 저장 (히스토리 추적 - 이 부분만 generate()와 다름)
     x_history = [x[0].clone().cpu()]
     
     if attention_mask is not None:
@@ -175,7 +79,7 @@ def generate_with_tracking(model, prompt, tokenizer, attention_mask=None, steps=
         for i in range(steps_per_block):
             mask_index = (x == mask_id)
             
-            # 모델 추론 및 Remasking 전략
+            # 모델 추론 및 Remasking 전략 (generate.py와 동일한 로직)
             if remasking == 'uncertainty_aware':
                 # MC Dropout으로 불확실성 분해
                 mean_logits, H_epistemic, H_aleatoric, p_bar = compute_uncertainty_decomposition(
@@ -251,7 +155,7 @@ def generate_with_tracking(model, prompt, tokenizer, attention_mask=None, steps=
             # 토큰 업데이트
             x[transfer_index] = x0[transfer_index]
             
-            # 현재 스텝의 시퀀스 상태 저장
+            # 현재 스텝의 시퀀스 상태 저장 (히스토리 추적 - 이 부분만 generate()와 다름)
             x_history.append(x[0].clone().cpu())
     
     return x, x_history

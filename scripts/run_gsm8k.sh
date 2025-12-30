@@ -21,6 +21,4 @@ python3 visualize_uncertainty_by_timestep.py \
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))
 
-echo "Note: Using --confidence_eos_eot_inf for GSM8K (as per LLaDA paper)"
-echo "Total samples processed from GSM8K test set"
 echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"

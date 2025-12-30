@@ -121,6 +121,8 @@ def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_
                 probs_sum = probs_sum + p
                 entropy_sum = entropy_sum + h_k
                 logits_sum = logits_sum + logits
+    except Exception as e:
+        raise e
 
     finally:
         disable_mc_dropout(model)
