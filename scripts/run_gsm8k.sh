@@ -15,9 +15,10 @@ python3 visualize_uncertainty_by_timestep.py \
     --remasking uncertainty_aware \
     --mc_samples 4  --alpha 1.0 --beta 1.0  --dropout_p 0.2 \
     --use_mc_dropout_logit \
-    --device cuda:1 \
+    --logits_eos_inf \
+    --device cuda:6 cuda:0 \
     --output_dir ./result \
-    --exp_name gsm8k_uncertainty_aware_use_mc_dropout_logit
+    --exp_name gsm8k_uncertainty_aware_use_mc_dropout_logit_logits_eos_inf
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))
 

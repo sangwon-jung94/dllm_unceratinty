@@ -13,8 +13,12 @@ from generate import (
 import torch.nn.functional as F
 import argparse
 import os
+import signal
+import sys
 from datetime import datetime
 from datasets import load_dataset
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 from tqdm import tqdm
 
@@ -362,14 +366,136 @@ def get_benchmark_prompts(benchmark_name, num_samples=None):
     return prompts
 
 
+def worker_init():
+    '''Initialize worker process to handle interrupts properly'''
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def process_batch_on_device(args_dict):
+    '''
+    Worker function to process a batch on a specific GPU device.
+    This function is called in parallel for each GPU.
+    
+    Args:
+        args_dict: Dictionary containing all necessary arguments
+    
+    Returns:
+        Tuple of (batch_outputs, uncertainty_history)
+    '''
+    # Extract arguments
+    device = args_dict['device']
+    batch_prompts = args_dict['batch_prompts']
+    model_path = args_dict['model_path']
+    steps = args_dict['steps']
+    gen_length = args_dict['gen_length']
+    block_length = args_dict['block_length']
+    temperature = args_dict['temperature']
+    cfg_scale = args_dict['cfg_scale']
+    remasking = args_dict['remasking']
+    logits_eos_inf = args_dict['logits_eos_inf']
+    confidence_eos_eot_inf = args_dict['confidence_eos_eot_inf']
+    mc_samples = args_dict['mc_samples']
+    alpha = args_dict['alpha']
+    beta = args_dict['beta']
+    dropout_p = args_dict['dropout_p']
+    use_mc_dropout_logit = args_dict['use_mc_dropout_logit']
+    use_prompt = args_dict['use_prompt']
+    batch_idx = args_dict['batch_idx']
+    
+    # Set device
+    torch.cuda.set_device(device)
+    
+    # Load model and tokenizer on this GPU
+    model = AutoModel.from_pretrained(
+        model_path, 
+        trust_remote_code=True, 
+        torch_dtype=torch.bfloat16
+    ).to(device).eval()
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, 
+        trust_remote_code=True
+    )
+    
+    if tokenizer.padding_side != 'left':
+        tokenizer.padding_side = 'left'
+    
+    # Process this batch
+    if use_prompt:
+        # Apply chat template if using Instruct model
+        messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
+        formatted_prompts = [
+            tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
+            for message in messages
+        ]
+
+        encoded_outputs = tokenizer(
+            formatted_prompts,
+            add_special_tokens=False,
+            padding=True,
+            return_tensors="pt"
+        )
+        input_ids = encoded_outputs['input_ids'].to(device)
+        attention_mask = encoded_outputs['attention_mask'].to(device)
+    else:
+        # For Instruct models, use minimal chat template
+        if 'Instruct' in model_path:
+            messages = [{'role': 'user', 'content': ''}]
+            template = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            prompts = [template] * len(batch_prompts)
+            
+            encoded_outputs = tokenizer(
+                prompts,
+                add_special_tokens=False,
+                padding=True,
+                return_tensors="pt"
+            )
+            input_ids = encoded_outputs['input_ids'].to(device)
+            attention_mask = encoded_outputs['attention_mask'].to(device)
+        else:
+            # For Base models, just use start token
+            start_token = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
+            input_ids = torch.tensor([[start_token]] * len(batch_prompts), device=device)
+            attention_mask = torch.ones_like(input_ids)
+    
+    # Generate with uncertainty tracking
+    out, uncertainty_history = generate_with_uncertainty_tracking(
+        model=model,
+        prompt=input_ids,
+        attention_mask=attention_mask,
+        steps=steps,
+        gen_length=gen_length,
+        block_length=block_length,
+        temperature=temperature,
+        cfg_scale=cfg_scale,
+        remasking=remasking,
+        logits_eos_inf=logits_eos_inf,
+        confidence_eos_eot_inf=confidence_eos_eot_inf,
+        mc_samples=mc_samples,
+        alpha=alpha,
+        beta=beta,
+        dropout_p=dropout_p,
+        use_mc_dropout_logit=use_mc_dropout_logit
+    )
+
+    # Decode output for this batch
+    batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+    
+    # Clean up to free GPU memory
+    del model
+    torch.cuda.empty_cache()
+    
+    return batch_output, uncertainty_history, batch_idx
+
+
 def main():
     parser = argparse.ArgumentParser(description='Visualize uncertainty over diffusion timesteps')
     
     # Model and device settings
     parser.add_argument('--model_path', type=str, default='GSAI-ML/LLaDA-8B-Instruct',
                         help='Path or name of the model')
-    parser.add_argument('--device', type=str, default='cuda:0',
-                        help='Device to run on (e.g., cuda:0, cpu)')
+    parser.add_argument('--device', type=str, nargs='+', default=['cuda:0'],
+                        help='Device(s) to run on (e.g., cuda:0 cuda:1 cuda:2). Multiple devices enable parallel processing.')
     
     # Generation parameters
     parser.add_argument('--steps', type=int, default=64,
@@ -436,14 +562,28 @@ def main():
     exp_output_dir = os.path.join(args.output_dir, args.exp_name)
     os.makedirs(exp_output_dir, exist_ok=True)
     
-    # Set device
-    device = args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu'
+    # Set devices - handle both single and multiple GPUs
+    devices = args.device if isinstance(args.device, list) else [args.device]
+    # Validate devices
+    valid_devices = []
+    for dev in devices:
+        if dev == 'cpu' or (torch.cuda.is_available() and 'cuda' in dev):
+            valid_devices.append(dev)
+        else:
+            print(f"Warning: Device {dev} not available, skipping...")
+    
+    if not valid_devices:
+        valid_devices = ['cpu']
+        print("Warning: No valid devices found, falling back to CPU")
+    
+    devices = valid_devices
+    num_devices = len(devices)
     
     print("=" * 80)
     print(f"Experiment: {args.exp_name}")
     print("=" * 80)
     print(f"Output Directory: {exp_output_dir}")
-    print(f"Device: {device}")
+    print(f"Device(s): {devices} ({num_devices} device{'s' if num_devices > 1 else ''})")
     print(f"Model: {args.model_path}")
     print(f"Steps: {args.steps}, Gen Length: {args.gen_length}, Block Length: {args.block_length}")
     print(f"Remasking Strategy: {args.remasking}")
@@ -455,22 +595,29 @@ def main():
         print(f"Benchmark: {args.benchmark}")
     print("=" * 80)
     
-    print("\nLoading model...")
-    model = AutoModel.from_pretrained(
-        args.model_path, 
-        trust_remote_code=True, 
-        torch_dtype=torch.bfloat16
-    ).to(device).eval()
+    # For single device, use the original sequential approach
+    # For multiple devices, we'll use parallel processing
+    use_parallel = num_devices > 1
     
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, 
-        trust_remote_code=True
-    )
-    
-    if tokenizer.padding_side != 'left':
-        tokenizer.padding_side = 'left'
-    
-    assert tokenizer.pad_token_id != 126336
+    if not use_parallel:
+        # Original single-device code path
+        device = devices[0]
+        print("\nLoading model...")
+        model = AutoModel.from_pretrained(
+            args.model_path, 
+            trust_remote_code=True, 
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path, 
+            trust_remote_code=True
+        )
+        
+        if tokenizer.padding_side != 'left':
+            tokenizer.padding_side = 'left'
+        
+        assert tokenizer.pad_token_id != 126336
     
     # Prepare prompts
     if args.use_prompt:
@@ -483,58 +630,127 @@ def main():
         
         print(f"\nTotal prompts to process: {len(all_prompts)}")
         print(f"Batch size: {args.batch_size}")
-        print(f"Number of batches: {(len(all_prompts) + args.batch_size - 1) // args.batch_size}")
+        num_batches = (len(all_prompts) + args.batch_size - 1) // args.batch_size
+        print(f"Number of batches: {num_batches}")
         
-        # Process in batches to avoid OOM
+        # Process in batches
         all_outputs = []
         all_uncertainty_histories = []
         
-        num_batches = (len(all_prompts) + args.batch_size - 1) // args.batch_size
-        for batch_idx in tqdm(range(0, len(all_prompts), args.batch_size), desc="Batch", total=num_batches):
-            batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
-            # tqdm 내부에서 별도 print는 생략
-            # print(f"\nProcessing batch {batch_idx // args.batch_size + 1}/{num_batches} ({len(batch_prompts)} samples)...")
+        if use_parallel:
+            # Parallel processing across multiple GPUs
+            print(f"\nUsing parallel processing across {num_devices} GPUs...")
+            
+            # Prepare batch arguments for all batches
+            batch_args_list = []
+            for batch_idx in range(0, len(all_prompts), args.batch_size):
+                batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
+                device_idx = (batch_idx // args.batch_size) % num_devices
+                
+                batch_args = {
+                    'device': devices[device_idx],
+                    'batch_prompts': batch_prompts,
+                    'model_path': args.model_path,
+                    'steps': args.steps,
+                    'gen_length': args.gen_length,
+                    'block_length': args.block_length,
+                    'temperature': args.temperature,
+                    'cfg_scale': args.cfg_scale,
+                    'remasking': args.remasking,
+                    'logits_eos_inf': args.logits_eos_inf,
+                    'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
+                    'mc_samples': args.mc_samples,
+                    'alpha': args.alpha,
+                    'beta': args.beta,
+                    'dropout_p': args.dropout_p,
+                    'use_mc_dropout_logit': args.use_mc_dropout_logit,
+                    'use_prompt': args.use_prompt,
+                    'batch_idx': batch_idx // args.batch_size
+                }
+                batch_args_list.append(batch_args)
+            
+            # Process batches in parallel
+            # Use spawn method to avoid CUDA initialization issues
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass  # Already set
+            
+            try:
+                with ProcessPoolExecutor(max_workers=num_devices, initializer=worker_init) as executor:
+                    # Submit all batch jobs
+                    futures = {executor.submit(process_batch_on_device, batch_args): batch_args['batch_idx'] 
+                              for batch_args in batch_args_list}
+                    
+                    # Collect results as they complete
+                    results = {}
+                    with tqdm(total=len(futures), desc="Processing batches") as pbar:
+                        for future in as_completed(futures):
+                            batch_idx = futures[future]
+                            try:
+                                batch_output, uncertainty_history, returned_batch_idx = future.result()
+                                results[returned_batch_idx] = (batch_output, uncertainty_history)
+                                pbar.update(1)
+                            except Exception as e:
+                                print(f"\nError processing batch {batch_idx}: {e}")
+                                raise
+            except KeyboardInterrupt:
+                print("\n\nInterrupted by user. Shutting down workers...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                print("Cleanup complete. Exiting.")
+                sys.exit(1)
+            
+            # Sort results by batch index and extract outputs
+            for batch_idx in sorted(results.keys()):
+                batch_output, uncertainty_history = results[batch_idx]
+                all_outputs.extend(batch_output)
+                all_uncertainty_histories.append(uncertainty_history)
+        
+        else:
+            # Sequential processing on single device (original code)
+            for batch_idx in tqdm(range(0, len(all_prompts), args.batch_size), desc="Batch", total=num_batches):
+                batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
 
-            # Apply chat template if using Instruct model
-            messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
-            formatted_prompts = [
-                tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
-                for message in messages
-            ]
+                # Apply chat template if using Instruct model
+                messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
+                formatted_prompts = [
+                    tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
+                    for message in messages
+                ]
 
-            encoded_outputs = tokenizer(
-                formatted_prompts,
-                add_special_tokens=False,
-                padding=True,
-                return_tensors="pt"
-            )
-            input_ids = encoded_outputs['input_ids'].to(device)
-            attention_mask = encoded_outputs['attention_mask'].to(device)
+                encoded_outputs = tokenizer(
+                    formatted_prompts,
+                    add_special_tokens=False,
+                    padding=True,
+                    return_tensors="pt"
+                )
+                input_ids = encoded_outputs['input_ids'].to(device)
+                attention_mask = encoded_outputs['attention_mask'].to(device)
 
-            # Generate with uncertainty tracking
-            out, uncertainty_history = generate_with_uncertainty_tracking(
-                model=model,
-                prompt=input_ids,
-                attention_mask=attention_mask,
-                steps=args.steps,
-                gen_length=args.gen_length,
-                block_length=args.block_length,
-                temperature=args.temperature,
-                cfg_scale=args.cfg_scale,
-                remasking=args.remasking,
-                logits_eos_inf=args.logits_eos_inf,
-                confidence_eos_eot_inf=args.confidence_eos_eot_inf,
-                mc_samples=args.mc_samples,
-                alpha=args.alpha,
-                beta=args.beta,
-                dropout_p=args.dropout_p,
-                use_mc_dropout_logit=args.use_mc_dropout_logit
-            )
+                # Generate with uncertainty tracking
+                out, uncertainty_history = generate_with_uncertainty_tracking(
+                    model=model,
+                    prompt=input_ids,
+                    attention_mask=attention_mask,
+                    steps=args.steps,
+                    gen_length=args.gen_length,
+                    block_length=args.block_length,
+                    temperature=args.temperature,
+                    cfg_scale=args.cfg_scale,
+                    remasking=args.remasking,
+                    logits_eos_inf=args.logits_eos_inf,
+                    confidence_eos_eot_inf=args.confidence_eos_eot_inf,
+                    mc_samples=args.mc_samples,
+                    alpha=args.alpha,
+                    beta=args.beta,
+                    dropout_p=args.dropout_p,
+                    use_mc_dropout_logit=args.use_mc_dropout_logit
+                )
 
-            # Decode output for this batch
-            batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-            all_outputs.extend(batch_output)
-            all_uncertainty_histories.append(uncertainty_history)
+                # Decode output for this batch
+                batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+                all_outputs.extend(batch_output)
+                all_uncertainty_histories.append(uncertainty_history)
         
         # Aggregate uncertainty histories (average across batches)
         aggregated_history = {
@@ -567,10 +783,35 @@ def main():
         print(f"\nFirst prompt example: {all_prompts[0][:100]}...")
     else:
         # No prompt - unconditional generation
+        # For unconditional generation, we currently only support single device
+        # (parallel processing is mainly useful when processing many prompts)
+        if use_parallel:
+            print("\nWarning: Parallel processing not needed for unconditional generation, using single device")
+            use_parallel = False
+            device = devices[0]
+            # Load model if not already loaded
+            if 'model' not in locals():
+                print("\nLoading model...")
+                model = AutoModel.from_pretrained(
+                    args.model_path, 
+                    trust_remote_code=True, 
+                    torch_dtype=torch.bfloat16
+                ).to(device).eval()
+                
+                tokenizer = AutoTokenizer.from_pretrained(
+                    args.model_path, 
+                    trust_remote_code=True
+                )
+                
+                if tokenizer.padding_side != 'left':
+                    tokenizer.padding_side = 'left'
+                
+                assert tokenizer.pad_token_id != 126336
+        
         batch_size = args.batch_size
         original_prompts = None  # No prompts for unconditional generation
         
-        # For Instruct models, we need to use the chat template even for \"unconditional\" generation
+        # For Instruct models, we need to use the chat template even for "unconditional" generation
         # Otherwise the model immediately outputs EOS tokens
         if 'Instruct' in args.model_path:
             # Create minimal chat template with empty user message
