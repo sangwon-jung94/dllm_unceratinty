@@ -1,7 +1,14 @@
 #!/bin/bash
 # 모든 GSM8K 결과를 채점하는 스크립트
 
-echo "Evaluating all GSM8K results..."
+# 첫 번째 인자로 max_samples 받기
+MAX_SAMPLES="$1"
+
+if [ -n "$MAX_SAMPLES" ]; then
+    echo "Evaluating GSM8K results (max $MAX_SAMPLES samples per experiment)..."
+else
+    echo "Evaluating all GSM8K results..."
+fi
 echo "================================"
 
 # result 디렉토리의 모든 gsm8k 관련 폴더 찾기
@@ -13,9 +20,16 @@ for result_dir in ./result/gsm8k_*/; do
         echo "-------------------"
         
         # 채점 실행 및 결과 저장
-        python3 evaluate_gsm8k.py \
-            --output_file "${result_dir}output.txt" \
-            --save_results "${result_dir}evaluation.json"
+        if [ -n "$MAX_SAMPLES" ]; then
+            python3 evaluate_gsm8k.py \
+                --output_file "${result_dir}output.txt" \
+                --save_results "${result_dir}evaluation.json" \
+                --max_samples "$MAX_SAMPLES"
+        else
+            python3 evaluate_gsm8k.py \
+                --output_file "${result_dir}output.txt" \
+                --save_results "${result_dir}evaluation.json"
+        fi
         
         echo ""
     fi

@@ -84,12 +84,13 @@ def normalize_number(num_str):
         return num_str
 
 
-def parse_output_file(output_file):
+def parse_output_file(output_file, max_samples=None):
     """
     output.txt 파일을 파싱하여 각 샘플의 질문과 답변을 추출합니다.
     
     Args:
         output_file: output.txt 파일 경로
+        max_samples: 최대 샘플 수 (None이면 전체)
         
     Returns:
         List of dicts with 'question' and 'answer' keys
@@ -112,25 +113,30 @@ def parse_output_file(output_file):
             'question': question.strip(),
             'answer': answer.strip()
         })
+        
+        # max_samples 제한
+        if max_samples is not None and len(samples) >= max_samples:
+            break
     
     return samples
 
 
-def evaluate_gsm8k(output_file, verbose=False):
+def evaluate_gsm8k(output_file, verbose=False, max_samples=None):
     """
     GSM8K 결과를 평가합니다.
     
     Args:
         output_file: output.txt 파일 경로
         verbose: 자세한 출력 여부
+        max_samples: 최대 샘플 수 (None이면 전체)
         
     Returns:
         Dict with evaluation metrics
     """
     # output.txt 파싱
     print(f"Parsing output file: {output_file}")
-    samples = parse_output_file(output_file)
-    print(f"Found {len(samples)} samples")
+    samples = parse_output_file(output_file, max_samples=max_samples)
+    print(f"Found {len(samples)} samples" + (f" (limited to {max_samples})" if max_samples else ""))
     
     # GSM8K 데이터셋 로드
     print("Loading GSM8K dataset...")
@@ -205,6 +211,8 @@ def main():
                         help='Print detailed results for each sample')
     parser.add_argument('--save_results', type=str, default=None,
                         help='Path to save detailed results (JSON format)')
+    parser.add_argument('--max_samples', type=int, default=None,
+                        help='Maximum number of samples to evaluate (default: all)')
     
     args = parser.parse_args()
     
@@ -215,7 +223,7 @@ def main():
         return
     
     # 평가 실행
-    metrics = evaluate_gsm8k(output_file, verbose=args.verbose)
+    metrics = evaluate_gsm8k(output_file, verbose=args.verbose, max_samples=args.max_samples)
     
     # 결과 출력
     print("\n" + "="*80)
