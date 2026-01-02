@@ -371,81 +371,43 @@ def worker_init():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
-def process_batch_on_device(args_dict):
-    '''
-    Worker function to process a batch on a specific GPU device.
-    This function is called in parallel for each GPU.
-    
-    Args:
-        args_dict: Dictionary containing all necessary arguments
-    
-    Returns:
-        Tuple of (batch_outputs, uncertainty_history)
-    '''
-    # Extract arguments
+def process_device_batches(args_dict):
+    '''Run all assigned batches sequentially on one device to avoid overlapping loads.'''
     device = args_dict['device']
-    batch_prompts = args_dict['batch_prompts']
-    model_path = args_dict['model_path']
-    steps = args_dict['steps']
-    gen_length = args_dict['gen_length']
-    block_length = args_dict['block_length']
-    temperature = args_dict['temperature']
-    cfg_scale = args_dict['cfg_scale']
-    remasking = args_dict['remasking']
-    logits_eos_inf = args_dict['logits_eos_inf']
-    confidence_eos_eot_inf = args_dict['confidence_eos_eot_inf']
-    mc_samples = args_dict['mc_samples']
-    alpha = args_dict['alpha']
-    beta = args_dict['beta']
-    dropout_p = args_dict['dropout_p']
-    use_mc_dropout_logit = args_dict['use_mc_dropout_logit']
-    use_prompt = args_dict['use_prompt']
-    batch_idx = args_dict['batch_idx']
+    device_batches = args_dict['device_batches']  # list of (batch_idx, batch_prompts)
+    common_args = args_dict['common_args']
     
-    # Set device
-    torch.cuda.set_device(device)
+    if device != 'cpu':
+        torch.cuda.set_device(device)
     
-    # Load model and tokenizer on this GPU
     model = AutoModel.from_pretrained(
-        model_path, 
+        common_args['model_path'], 
         trust_remote_code=True, 
         torch_dtype=torch.bfloat16
     ).to(device).eval()
     
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path, 
+        common_args['model_path'], 
         trust_remote_code=True
     )
     
     if tokenizer.padding_side != 'left':
         tokenizer.padding_side = 'left'
     
-    # Process this batch
-    if use_prompt:
-        # Apply chat template if using Instruct model
-        messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
-        formatted_prompts = [
-            tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
-            for message in messages
-        ]
+    results = []
+    
+    for batch_idx, batch_prompts in device_batches:
+        # Process this batch
+        if common_args['use_prompt']:
+            # Apply chat template if using Instruct model
+            messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
+            formatted_prompts = [
+                tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
+                for message in messages
+            ]
 
-        encoded_outputs = tokenizer(
-            formatted_prompts,
-            add_special_tokens=False,
-            padding=True,
-            return_tensors="pt"
-        )
-        input_ids = encoded_outputs['input_ids'].to(device)
-        attention_mask = encoded_outputs['attention_mask'].to(device)
-    else:
-        # For Instruct models, use minimal chat template
-        if 'Instruct' in model_path:
-            messages = [{'role': 'user', 'content': ''}]
-            template = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            prompts = [template] * len(batch_prompts)
-            
             encoded_outputs = tokenizer(
-                prompts,
+                formatted_prompts,
                 add_special_tokens=False,
                 padding=True,
                 return_tensors="pt"
@@ -453,39 +415,55 @@ def process_batch_on_device(args_dict):
             input_ids = encoded_outputs['input_ids'].to(device)
             attention_mask = encoded_outputs['attention_mask'].to(device)
         else:
-            # For Base models, just use start token
-            start_token = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
-            input_ids = torch.tensor([[start_token]] * len(batch_prompts), device=device)
-            attention_mask = torch.ones_like(input_ids)
-    
-    # Generate with uncertainty tracking
-    out, uncertainty_history = generate_with_uncertainty_tracking(
-        model=model,
-        prompt=input_ids,
-        attention_mask=attention_mask,
-        steps=steps,
-        gen_length=gen_length,
-        block_length=block_length,
-        temperature=temperature,
-        cfg_scale=cfg_scale,
-        remasking=remasking,
-        logits_eos_inf=logits_eos_inf,
-        confidence_eos_eot_inf=confidence_eos_eot_inf,
-        mc_samples=mc_samples,
-        alpha=alpha,
-        beta=beta,
-        dropout_p=dropout_p,
-        use_mc_dropout_logit=use_mc_dropout_logit
-    )
+            # For Instruct models, use minimal chat template
+            if 'Instruct' in common_args['model_path']:
+                messages = [{'role': 'user', 'content': ''}]
+                template = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+                prompts = [template] * len(batch_prompts)
+                
+                encoded_outputs = tokenizer(
+                    prompts,
+                    add_special_tokens=False,
+                    padding=True,
+                    return_tensors="pt"
+                )
+                input_ids = encoded_outputs['input_ids'].to(device)
+                attention_mask = encoded_outputs['attention_mask'].to(device)
+            else:
+                # For Base models, just use start token
+                start_token = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
+                input_ids = torch.tensor([[start_token]] * len(batch_prompts), device=device)
+                attention_mask = torch.ones_like(input_ids)
+        
+        # Generate with uncertainty tracking
+        out, uncertainty_history = generate_with_uncertainty_tracking(
+            model=model,
+            prompt=input_ids,
+            attention_mask=attention_mask,
+            steps=common_args['steps'],
+            gen_length=common_args['gen_length'],
+            block_length=common_args['block_length'],
+            temperature=common_args['temperature'],
+            cfg_scale=common_args['cfg_scale'],
+            remasking=common_args['remasking'],
+            logits_eos_inf=common_args['logits_eos_inf'],
+            confidence_eos_eot_inf=common_args['confidence_eos_eot_inf'],
+            mc_samples=common_args['mc_samples'],
+            alpha=common_args['alpha'],
+            beta=common_args['beta'],
+            dropout_p=common_args['dropout_p'],
+            use_mc_dropout_logit=common_args['use_mc_dropout_logit']
+        )
 
-    # Decode output for this batch
-    batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+        # Decode output for this batch
+        batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+        results.append((batch_idx, batch_output, uncertainty_history))
     
-    # Clean up to free GPU memory
     del model
-    torch.cuda.empty_cache()
+    if device != 'cpu':
+        torch.cuda.empty_cache()
     
-    return batch_output, uncertainty_history, batch_idx
+    return results
 
 
 def main():
@@ -641,33 +619,12 @@ def main():
             # Parallel processing across multiple GPUs
             print(f"\nUsing parallel processing across {num_devices} GPUs...")
             
-            # Prepare batch arguments for all batches
-            batch_args_list = []
+            # Round-robin assign batches to devices but process sequentially per device to avoid overlapping models on the same GPU.
+            per_device_batches = {dev: [] for dev in devices}
             for batch_idx in range(0, len(all_prompts), args.batch_size):
                 batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
                 device_idx = (batch_idx // args.batch_size) % num_devices
-                
-                batch_args = {
-                    'device': devices[device_idx],
-                    'batch_prompts': batch_prompts,
-                    'model_path': args.model_path,
-                    'steps': args.steps,
-                    'gen_length': args.gen_length,
-                    'block_length': args.block_length,
-                    'temperature': args.temperature,
-                    'cfg_scale': args.cfg_scale,
-                    'remasking': args.remasking,
-                    'logits_eos_inf': args.logits_eos_inf,
-                    'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
-                    'mc_samples': args.mc_samples,
-                    'alpha': args.alpha,
-                    'beta': args.beta,
-                    'dropout_p': args.dropout_p,
-                    'use_mc_dropout_logit': args.use_mc_dropout_logit,
-                    'use_prompt': args.use_prompt,
-                    'batch_idx': batch_idx // args.batch_size
-                }
-                batch_args_list.append(batch_args)
+                per_device_batches[devices[device_idx]].append((batch_idx // args.batch_size, batch_prompts))
             
             # Process batches in parallel
             # Use spawn method to avoid CUDA initialization issues
@@ -676,23 +633,49 @@ def main():
             except RuntimeError:
                 pass  # Already set
             
+            common_args = {
+                'model_path': args.model_path,
+                'steps': args.steps,
+                'gen_length': args.gen_length,
+                'block_length': args.block_length,
+                'temperature': args.temperature,
+                'cfg_scale': args.cfg_scale,
+                'remasking': args.remasking,
+                'logits_eos_inf': args.logits_eos_inf,
+                'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
+                'mc_samples': args.mc_samples,
+                'alpha': args.alpha,
+                'beta': args.beta,
+                'dropout_p': args.dropout_p,
+                'use_mc_dropout_logit': args.use_mc_dropout_logit,
+                'use_prompt': args.use_prompt
+            }
+            
             try:
                 with ProcessPoolExecutor(max_workers=num_devices, initializer=worker_init) as executor:
-                    # Submit all batch jobs
-                    futures = {executor.submit(process_batch_on_device, batch_args): batch_args['batch_idx'] 
-                              for batch_args in batch_args_list}
+                    # Submit one job per device
+                    futures = {
+                        executor.submit(
+                            process_device_batches,
+                            {
+                                'device': device,
+                                'device_batches': per_device_batches[device],
+                                'common_args': common_args
+                            }
+                        ): device for device in devices if per_device_batches[device]
+                    }
                     
                     # Collect results as they complete
                     results = {}
                     with tqdm(total=len(futures), desc="Processing batches") as pbar:
                         for future in as_completed(futures):
-                            batch_idx = futures[future]
                             try:
-                                batch_output, uncertainty_history, returned_batch_idx = future.result()
-                                results[returned_batch_idx] = (batch_output, uncertainty_history)
+                                batch_results = future.result()
+                                for batch_idx, batch_output, uncertainty_history in batch_results:
+                                    results[batch_idx] = (batch_output, uncertainty_history)
                                 pbar.update(1)
                             except Exception as e:
-                                print(f"\nError processing batch {batch_idx}: {e}")
+                                print(f"\nError processing device {futures[future]}: {e}")
                                 raise
             except KeyboardInterrupt:
                 print("\n\nInterrupted by user. Shutting down workers...")
