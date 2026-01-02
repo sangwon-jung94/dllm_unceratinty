@@ -159,7 +159,7 @@ def generate_with_uncertainty_tracking(
             # Apply confidence_eos_eot_inf before computing remasking scores
             # This ensures EOS/EoT tokens are unmasked last
             if confidence_eos_eot_inf:
-                logits_with_noise[:, :, 126081] = logits[:, :, 126348] = -torch.inf
+                logits[:, :, 126081] = logits[:, :, 126348] = -torch.inf
 
             # Choose remasking strategy
             if remasking == 'uncertainty_aware':

@@ -3,7 +3,7 @@
 # Base: PyTorch 2.7.0 + CUDA 12.8 + cuDNN 9
 # -----------------------------------------------------
 
-FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-devel
 
 # 기본 유틸 설치
 RUN apt-get update && apt-get install -y \

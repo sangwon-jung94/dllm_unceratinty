@@ -15,7 +15,12 @@ import os
 import matplotlib.pyplot as plt
 from datetime import datetime
 from datasets import load_dataset
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import signal
+import sys
 from tqdm import tqdm
+import psutil
 
 
 def compute_entropy(p, dim=-1):
@@ -183,6 +188,13 @@ def generate_with_single_sample_remasking(
         'std_epistemic': [],
         'std_aleatoric': [],
         'std_total': [],
+        # For tracking uncertainty of actually unmasked tokens
+        'mean_epistemic_unmasked': [],
+        'mean_aleatoric_unmasked': [],
+        'mean_total_unmasked': [],
+        'std_epistemic_unmasked': [],
+        'std_aleatoric_unmasked': [],
+        'std_total_unmasked': [],
     }
     
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
@@ -291,6 +303,27 @@ def generate_with_single_sample_remasking(
                 batch_indices = torch.arange(confidence.shape[0], device=x0.device).unsqueeze(1).expand(-1, max_k)
                 transfer_index[batch_indices[valid_mask], topk_indices[valid_mask]] = True
             
+            # Track uncertainty for actually unmasked tokens (before updating x)
+            if transfer_index.any():
+                epistemic_unmasked = H_epistemic[transfer_index]
+                aleatoric_unmasked = H_aleatoric[transfer_index]
+                total_unmasked = H_total[transfer_index]
+                
+                uncertainty_history['mean_epistemic_unmasked'].append(epistemic_unmasked.mean().item())
+                uncertainty_history['mean_aleatoric_unmasked'].append(aleatoric_unmasked.mean().item())
+                uncertainty_history['mean_total_unmasked'].append(total_unmasked.mean().item())
+                uncertainty_history['std_epistemic_unmasked'].append(epistemic_unmasked.std().item())
+                uncertainty_history['std_aleatoric_unmasked'].append(aleatoric_unmasked.std().item())
+                uncertainty_history['std_total_unmasked'].append(total_unmasked.std().item())
+            else:
+                # No tokens unmasked in this step (shouldn't happen but just in case)
+                uncertainty_history['mean_epistemic_unmasked'].append(0.0)
+                uncertainty_history['mean_aleatoric_unmasked'].append(0.0)
+                uncertainty_history['mean_total_unmasked'].append(0.0)
+                uncertainty_history['std_epistemic_unmasked'].append(0.0)
+                uncertainty_history['std_aleatoric_unmasked'].append(0.0)
+                uncertainty_history['std_total_unmasked'].append(0.0)
+            
             x[transfer_index] = x0[transfer_index]
             global_step += 1
 
@@ -345,14 +378,117 @@ def plot_uncertainty_over_time(uncertainty_history, save_path='uncertainty_over_
     plt.close()
 
 
+def worker_init():
+    """Ignore SIGINT in worker processes so the main process can handle interrupts."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def process_batch_on_device(args_dict):
+    """Run a batch on a specific device for parallel multi-GPU execution."""
+    device = args_dict['device']
+    batch_prompts = args_dict['batch_prompts']
+    model_path = args_dict['model_path']
+    steps = args_dict['steps']
+    gen_length = args_dict['gen_length']
+    block_length = args_dict['block_length']
+    temperature = args_dict['temperature']
+    cfg_scale = args_dict['cfg_scale']
+    remasking = args_dict['remasking']
+    logits_eos_inf = args_dict['logits_eos_inf']
+    confidence_eos_eot_inf = args_dict['confidence_eos_eot_inf']
+    mc_samples = args_dict['mc_samples']
+    alpha = args_dict['alpha']
+    beta = args_dict['beta']
+    dropout_p = args_dict['dropout_p']
+    use_single_sample_for_remasking = args_dict['use_single_sample_for_remasking']
+    mask_id = args_dict['mask_id']
+    batch_idx = args_dict['batch_idx']
+
+    if device != 'cpu':
+        torch.cuda.set_device(device)
+
+    model = AutoModel.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16
+    ).to(device).eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True
+    )
+
+    if tokenizer.padding_side != 'left':
+        tokenizer.padding_side = 'left'
+
+    messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
+    formatted_prompts = [
+        tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False)
+        for message in messages
+    ]
+
+    encoded_outputs = tokenizer(
+        formatted_prompts,
+        add_special_tokens=False,
+        padding=True,
+        return_tensors="pt"
+    )
+    input_ids = encoded_outputs['input_ids'].to(device)
+    attention_mask = encoded_outputs['attention_mask'].to(device)
+
+    out, uncertainty_history = generate_with_single_sample_remasking(
+        model=model,
+        prompt=input_ids,
+        attention_mask=attention_mask,
+        steps=steps,
+        gen_length=gen_length,
+        block_length=block_length,
+        temperature=temperature,
+        cfg_scale=cfg_scale,
+        remasking=remasking,
+        mask_id=mask_id,
+        logits_eos_inf=logits_eos_inf,
+        confidence_eos_eot_inf=confidence_eos_eot_inf,
+        mc_samples=mc_samples,
+        alpha=alpha,
+        beta=beta,
+        dropout_p=dropout_p,
+        use_single_sample_for_remasking=use_single_sample_for_remasking
+    )
+
+    batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+
+    del model
+    if device != 'cpu':
+        torch.cuda.empty_cache()
+
+    return batch_output, uncertainty_history, batch_idx
+
+
+def get_benchmark_prompts(benchmark_name, num_samples=None):
+    """Load prompts from selected benchmark for prompt-based generation."""
+    prompts = []
+
+    if benchmark_name == 'gsm8k':
+        dataset = load_dataset('gsm8k', 'main', split='test')
+        num_to_use = len(dataset) if num_samples is None else min(num_samples, len(dataset))
+        prompts = [item['question'] for item in dataset.select(range(num_to_use))]
+    else:
+        raise ValueError(f"Unknown benchmark: {benchmark_name}")
+
+    return prompts
+
+
 def main():
     parser = argparse.ArgumentParser(description='실험: 앙상블 샘플링 + 단일 샘플 remasking')
     
     # Model and device settings
     parser.add_argument('--model_path', type=str, default='GSAI-ML/LLaDA-8B-Instruct',
                         help='Path or name of the model')
-    parser.add_argument('--device', type=str, default='cuda:0',
-                        help='Device to run on')
+    parser.add_argument('--device', type=str, nargs='+', default=['cuda:0'],
+                        help='Device(s) to run on (e.g., cuda:0 cuda:1 cpu)')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Number of prompts to process per batch (per device). Default = all prompts.')
     
     # Generation parameters
     parser.add_argument('--steps', type=int, default=64,
@@ -378,6 +514,8 @@ def main():
                         help='Weight for aleatoric uncertainty')
     parser.add_argument('--dropout_p', type=float, default=0.1,
                         help='Dropout probability for MC Dropout')
+    parser.add_argument('--use_mc_dropout_logit', action='store_true',
+                        help='(Compatibility) Accept flag; logits already use MC dropout by design')
     
     # Experiment toggle
     parser.add_argument('--use_single_sample_for_remasking', action='store_true',
@@ -399,6 +537,13 @@ def main():
                         help='Prompt text')
     parser.add_argument('--num_samples', type=int, default=5,
                         help='Number of samples to generate')
+    parser.add_argument('--use_prompt', action='store_true',
+                        help='Use benchmark/custom prompts instead of repeating --prompt')
+    parser.add_argument('--benchmark', type=str, default='gsm8k',
+                        choices=['gsm8k', 'custom'],
+                        help='Benchmark name when --use_prompt is set')
+    parser.add_argument('--custom_prompt', type=str, default=None,
+                        help='Custom prompt text when benchmark=custom')
     
     # Output settings
     parser.add_argument('--output_dir', type=str, default='./result',
@@ -418,77 +563,210 @@ def main():
     exp_output_dir = os.path.join(args.output_dir, args.exp_name)
     os.makedirs(exp_output_dir, exist_ok=True)
     
-    device = args.device
-    
+    # Device setup
+    devices = args.device if isinstance(args.device, list) else [args.device]
+    valid_devices = []
+    for dev in devices:
+        if dev == 'cpu' or (torch.cuda.is_available() and 'cuda' in dev):
+            valid_devices.append(dev)
+        else:
+            print(f"Warning: Device {dev} not available, skipping...")
+
+    if not valid_devices:
+        valid_devices = ['cpu']
+        print("Warning: No valid devices found, falling back to CPU")
+
+    devices = valid_devices
+    num_devices = len(devices)
+    use_parallel = num_devices > 1
+
+    # Prepare prompts
+    if args.use_prompt:
+        if args.benchmark == 'custom':
+            if args.custom_prompt is not None:
+                all_prompts = [args.custom_prompt]
+            else:
+                all_prompts = [args.prompt]
+        else:
+            all_prompts = get_benchmark_prompts(args.benchmark, args.num_samples)
+    else:
+        all_prompts = [args.prompt] * args.num_samples
+    batch_size = args.batch_size if args.batch_size is not None else len(all_prompts)
+    num_batches = (len(all_prompts) + batch_size - 1) // batch_size
+
     print("=" * 80)
     print(f"실험: 앙상블 샘플링 + {'단일 샘플' if args.use_single_sample_for_remasking else '앙상블'} Remasking")
     print("=" * 80)
     print(f"Output Directory: {exp_output_dir}")
-    print(f"Device: {device}")
+    print(f"Device(s): {devices} ({num_devices} device{'s' if num_devices > 1 else ''})")
+    print(f"Batch size: {batch_size}")
     print(f"Model: {args.model_path}")
     print(f"Remasking Strategy: {args.remasking}")
     print(f"MC Samples: {args.mc_samples}, Dropout: {args.dropout_p}")
     print(f"Use Single Sample for Remasking: {args.use_single_sample_for_remasking}")
     print("=" * 80)
-    
-    # Load model
-    print("\nLoading model...")
-    model = AutoModel.from_pretrained(
-        args.model_path, 
-        trust_remote_code=True, 
-        torch_dtype=torch.bfloat16
-    ).to(device).eval()
-    
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, 
-        trust_remote_code=True
-    )
-    
-    if tokenizer.padding_side != 'left':
-        tokenizer.padding_side = 'left'
-    
-    # Prepare prompt
-    messages = [{"role": "user", "content": args.prompt}] * args.num_samples
-    formatted_prompts = [
-        tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
-        for message in messages
-    ]
-    
-    encoded_outputs = tokenizer(
-        formatted_prompts,
-        add_special_tokens=False,
-        padding=True,
-        return_tensors="pt"
-    )
-    input_ids = encoded_outputs['input_ids'].to(device)
-    attention_mask = encoded_outputs['attention_mask'].to(device)
-    
-    print(f"\nPrompt: {args.prompt}")
-    print(f"Generating {args.num_samples} samples...\n")
-    
-    # Generate
-    out, uncertainty_history = generate_with_single_sample_remasking(
-        model=model,
-        prompt=input_ids,
-        attention_mask=attention_mask,
-        steps=args.steps,
-        gen_length=args.gen_length,
-        block_length=args.block_length,
-        temperature=args.temperature,
-        cfg_scale=args.cfg_scale,
-        remasking=args.remasking,
-        logits_eos_inf=args.logits_eos_inf,
-        confidence_eos_eot_inf=args.confidence_eos_eot_inf,
-        mc_samples=args.mc_samples,
-        alpha=args.alpha,
-        beta=args.beta,
-        dropout_p=args.dropout_p,
-        use_single_sample_for_remasking=args.use_single_sample_for_remasking
-    )
-    
-    # Decode output
-    output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-    
+    if args.use_prompt:
+        print(f"\nBenchmark: {args.benchmark}")
+        if args.benchmark == 'custom' and args.custom_prompt:
+            print(f"Custom prompt: {args.custom_prompt[:80]}{'...' if len(args.custom_prompt) > 80 else ''}")
+    else:
+        print(f"\nPrompt: {args.prompt}")
+    print(f"Total samples: {len(all_prompts)} (batches: {num_batches})\n")
+
+    all_outputs = []
+    all_uncertainty_histories = []
+
+    if use_parallel:
+        print(f"Using parallel processing across {num_devices} devices...\n")
+
+        batch_args_list = []
+        for batch_idx in range(0, len(all_prompts), batch_size):
+            batch_prompts = all_prompts[batch_idx:batch_idx + batch_size]
+            device_idx = (batch_idx // batch_size) % num_devices
+
+            batch_args = {
+                'device': devices[device_idx],
+                'batch_prompts': batch_prompts,
+                'model_path': args.model_path,
+                'steps': args.steps,
+                'gen_length': args.gen_length,
+                'block_length': args.block_length,
+                'temperature': args.temperature,
+                'cfg_scale': args.cfg_scale,
+                'remasking': args.remasking,
+                'logits_eos_inf': args.logits_eos_inf,
+                'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
+                'mc_samples': args.mc_samples,
+                'alpha': args.alpha,
+                'beta': args.beta,
+                'dropout_p': args.dropout_p,
+                'use_single_sample_for_remasking': args.use_single_sample_for_remasking,
+                'mask_id': 126336,
+                'batch_idx': batch_idx // batch_size
+            }
+            batch_args_list.append(batch_args)
+
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+
+        executor = None
+        try:
+            with ProcessPoolExecutor(max_workers=num_devices, initializer=worker_init) as executor:
+                futures = {executor.submit(process_batch_on_device, batch_args): batch_args['batch_idx']
+                          for batch_args in batch_args_list}
+
+                results = {}
+                with tqdm(total=len(futures), desc="Processing batches") as pbar:
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            batch_output, uncertainty_history, returned_idx = future.result()
+                            results[returned_idx] = (batch_output, uncertainty_history)
+                            pbar.update(1)
+                        except Exception as e:
+                            print(f"\nError processing batch {idx}: {e}")
+                            raise
+        except KeyboardInterrupt:
+            print("\n\n[!] Interrupted by user (Ctrl+C). Shutting down...")
+            if executor:
+                print("Cancelling running tasks...")
+                executor.shutdown(wait=False, cancel_futures=True)
+            print("Terminating worker processes...")
+            # Force kill all child processes
+            import psutil
+            current_process = psutil.Process()
+            children = current_process.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()
+                except:
+                    pass
+            print("Cleanup complete. Exiting.")
+            sys.exit(0)
+
+        for batch_idx in sorted(results.keys()):
+            batch_output, uncertainty_history = results[batch_idx]
+            all_outputs.extend(batch_output)
+            all_uncertainty_histories.append(uncertainty_history)
+
+    else:
+        device = devices[0]
+        print("\nLoading model...")
+        model = AutoModel.from_pretrained(
+            args.model_path, 
+            trust_remote_code=True, 
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path, 
+            trust_remote_code=True
+        )
+        
+        if tokenizer.padding_side != 'left':
+            tokenizer.padding_side = 'left'
+
+        for batch_idx in tqdm(range(0, len(all_prompts), batch_size), desc="Batch", total=num_batches):
+            batch_prompts = all_prompts[batch_idx:batch_idx + batch_size]
+
+            messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
+            formatted_prompts = [
+                tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
+                for message in messages
+            ]
+
+            encoded_outputs = tokenizer(
+                formatted_prompts,
+                add_special_tokens=False,
+                padding=True,
+                return_tensors="pt"
+            )
+            input_ids = encoded_outputs['input_ids'].to(device)
+            attention_mask = encoded_outputs['attention_mask'].to(device)
+
+            out, uncertainty_history = generate_with_single_sample_remasking(
+                model=model,
+                prompt=input_ids,
+                attention_mask=attention_mask,
+                steps=args.steps,
+                gen_length=args.gen_length,
+                block_length=args.block_length,
+                temperature=args.temperature,
+                cfg_scale=args.cfg_scale,
+                remasking=args.remasking,
+                logits_eos_inf=args.logits_eos_inf,
+                confidence_eos_eot_inf=args.confidence_eos_eot_inf,
+                mc_samples=args.mc_samples,
+                alpha=args.alpha,
+                beta=args.beta,
+                dropout_p=args.dropout_p,
+                use_single_sample_for_remasking=args.use_single_sample_for_remasking
+            )
+
+            batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+            all_outputs.extend(batch_output)
+            all_uncertainty_histories.append(uncertainty_history)
+
+    # Aggregate histories across batches/devices
+    history_keys = ['mean_epistemic', 'mean_aleatoric', 'mean_total', 
+                    'std_epistemic', 'std_aleatoric', 'std_total',
+                    'mean_epistemic_unmasked', 'mean_aleatoric_unmasked', 'mean_total_unmasked',
+                    'std_epistemic_unmasked', 'std_aleatoric_unmasked', 'std_total_unmasked']
+    if not all_uncertainty_histories:
+        raise RuntimeError("No uncertainty histories collected.")
+
+    if len(all_uncertainty_histories) == 1:
+        uncertainty_history = all_uncertainty_histories[0]
+    else:
+        aggregated_history = {'timesteps': all_uncertainty_histories[0]['timesteps']}
+        for key in history_keys:
+            aggregated_history[key] = np.mean([hist[key] for hist in all_uncertainty_histories], axis=0).tolist()
+        uncertainty_history = aggregated_history
+
+    output = all_outputs
+
     # Print results
     print("\n" + "=" * 80)
     print("Generated outputs:")
