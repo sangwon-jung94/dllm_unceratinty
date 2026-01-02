@@ -102,8 +102,15 @@ def generate_simple(
             elif remasking == 'random':
                 # Random selection
                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+            elif remasking == 'entropy':
+                # Use entropy (lower entropy = more confident = unmask first)
+                p = F.softmax(logits, dim=-1)
+                log_p = torch.log(p + 1e-10)  # Add small epsilon to avoid log(0)
+                entropy = -torch.sum(p * log_p, dim=-1)
+                # Negate entropy so lower entropy (more confident) gets higher priority
+                x0_p = -entropy
             else:
-                raise ValueError(f"Unsupported remasking strategy: {remasking}. Use 'low_confidence' or 'random'.")
+                raise ValueError(f"Unsupported remasking strategy: {remasking}. Use 'low_confidence', 'random', or 'entropy'.")
             
             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
@@ -202,7 +209,7 @@ def main():
     
     # Remasking strategy (only low_confidence and random)
     parser.add_argument('--remasking', type=str, default='low_confidence',
-                        choices=['low_confidence', 'random'],
+                        choices=['low_confidence', 'random', 'entropy'],
                         help='Remasking strategy (uncertainty_aware not supported)')
 
     parser.add_argument('--dropout_p', type=float, default=None,
@@ -380,7 +387,7 @@ def main():
             cfg_scale=args.cfg_scale,
             remasking=args.remasking,
             logits_eos_inf=args.logits_eos_inf,
-            confㅌidence_eos_eot_inf=args.confidence_eos_eot_inf,
+            confidence_eos_eot_inf=args.confidence_eos_eot_inf,
             dropout_p=args.dropout_p,
         )
         
