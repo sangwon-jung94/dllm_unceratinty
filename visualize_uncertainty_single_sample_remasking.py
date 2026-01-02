@@ -220,7 +220,7 @@ def generate_with_single_sample_remasking(
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
-        for i in tqdm(range(steps_per_block), desc=f"Block {num_block+1}/{num_blocks} steps", leave=False):
+        for i in tqdm(range(steps_per_block), desc=f"Block {num_block+1}/{num_blocks} steps", leave=False, position=1):
             mask_index = (x == mask_id)
             
             # Compute uncertainty decomposition with single sample
@@ -383,86 +383,75 @@ def worker_init():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
-def process_batch_on_device(args_dict):
-    """Run a batch on a specific device for parallel multi-GPU execution."""
+def process_device_batches(args_dict):
+    """Run all assigned batches sequentially on one device to avoid overlapping loads."""
     device = args_dict['device']
-    batch_prompts = args_dict['batch_prompts']
-    model_path = args_dict['model_path']
-    steps = args_dict['steps']
-    gen_length = args_dict['gen_length']
-    block_length = args_dict['block_length']
-    temperature = args_dict['temperature']
-    cfg_scale = args_dict['cfg_scale']
-    remasking = args_dict['remasking']
-    logits_eos_inf = args_dict['logits_eos_inf']
-    confidence_eos_eot_inf = args_dict['confidence_eos_eot_inf']
-    mc_samples = args_dict['mc_samples']
-    alpha = args_dict['alpha']
-    beta = args_dict['beta']
-    dropout_p = args_dict['dropout_p']
-    use_single_sample_for_remasking = args_dict['use_single_sample_for_remasking']
-    mask_id = args_dict['mask_id']
-    batch_idx = args_dict['batch_idx']
+    device_batches = args_dict['device_batches']  # list of (batch_idx, batch_prompts)
+    common_args = args_dict['common_args']
 
     if device != 'cpu':
         torch.cuda.set_device(device)
 
     model = AutoModel.from_pretrained(
-        model_path,
+        common_args['model_path'],
         trust_remote_code=True,
         torch_dtype=torch.bfloat16
     ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
+        common_args['model_path'],
         trust_remote_code=True
     )
 
     if tokenizer.padding_side != 'left':
         tokenizer.padding_side = 'left'
 
-    messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
-    formatted_prompts = [
-        tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False)
-        for message in messages
-    ]
+    results = []
 
-    encoded_outputs = tokenizer(
-        formatted_prompts,
-        add_special_tokens=False,
-        padding=True,
-        return_tensors="pt"
-    )
-    input_ids = encoded_outputs['input_ids'].to(device)
-    attention_mask = encoded_outputs['attention_mask'].to(device)
+    for batch_idx, batch_prompts in device_batches:
+        messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
+        formatted_prompts = [
+            tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False)
+            for message in messages
+        ]
 
-    out, uncertainty_history = generate_with_single_sample_remasking(
-        model=model,
-        prompt=input_ids,
-        attention_mask=attention_mask,
-        steps=steps,
-        gen_length=gen_length,
-        block_length=block_length,
-        temperature=temperature,
-        cfg_scale=cfg_scale,
-        remasking=remasking,
-        mask_id=mask_id,
-        logits_eos_inf=logits_eos_inf,
-        confidence_eos_eot_inf=confidence_eos_eot_inf,
-        mc_samples=mc_samples,
-        alpha=alpha,
-        beta=beta,
-        dropout_p=dropout_p,
-        use_single_sample_for_remasking=use_single_sample_for_remasking
-    )
+        encoded_outputs = tokenizer(
+            formatted_prompts,
+            add_special_tokens=False,
+            padding=True,
+            return_tensors="pt"
+        )
+        input_ids = encoded_outputs['input_ids'].to(device)
+        attention_mask = encoded_outputs['attention_mask'].to(device)
 
-    batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+        out, uncertainty_history = generate_with_single_sample_remasking(
+            model=model,
+            prompt=input_ids,
+            attention_mask=attention_mask,
+            steps=common_args['steps'],
+            gen_length=common_args['gen_length'],
+            block_length=common_args['block_length'],
+            temperature=common_args['temperature'],
+            cfg_scale=common_args['cfg_scale'],
+            remasking=common_args['remasking'],
+            mask_id=common_args['mask_id'],
+            logits_eos_inf=common_args['logits_eos_inf'],
+            confidence_eos_eot_inf=common_args['confidence_eos_eot_inf'],
+            mc_samples=common_args['mc_samples'],
+            alpha=common_args['alpha'],
+            beta=common_args['beta'],
+            dropout_p=common_args['dropout_p'],
+            use_single_sample_for_remasking=common_args['use_single_sample_for_remasking']
+        )
+
+        batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+        results.append((batch_idx, batch_output, uncertainty_history))
 
     del model
     if device != 'cpu':
         torch.cuda.empty_cache()
 
-    return batch_output, uncertainty_history, batch_idx
+    return results
 
 
 def get_benchmark_prompts(benchmark_name, num_samples=None):
@@ -619,54 +608,69 @@ def main():
     if use_parallel:
         print(f"Using parallel processing across {num_devices} devices...\n")
 
-        batch_args_list = []
+        # Round-robin assign batches to devices but process sequentially per device to avoid overlapping models on the same GPU.
+        per_device_batches = {dev: [] for dev in devices}
         for batch_idx in range(0, len(all_prompts), batch_size):
             batch_prompts = all_prompts[batch_idx:batch_idx + batch_size]
             device_idx = (batch_idx // batch_size) % num_devices
-
-            batch_args = {
-                'device': devices[device_idx],
-                'batch_prompts': batch_prompts,
-                'model_path': args.model_path,
-                'steps': args.steps,
-                'gen_length': args.gen_length,
-                'block_length': args.block_length,
-                'temperature': args.temperature,
-                'cfg_scale': args.cfg_scale,
-                'remasking': args.remasking,
-                'logits_eos_inf': args.logits_eos_inf,
-                'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
-                'mc_samples': args.mc_samples,
-                'alpha': args.alpha,
-                'beta': args.beta,
-                'dropout_p': args.dropout_p,
-                'use_single_sample_for_remasking': args.use_single_sample_for_remasking,
-                'mask_id': 126336,
-                'batch_idx': batch_idx // batch_size
-            }
-            batch_args_list.append(batch_args)
+            per_device_batches[devices[device_idx]].append((batch_idx // batch_size, batch_prompts))
 
         try:
             mp.set_start_method('spawn', force=True)
         except RuntimeError:
             pass
 
+        common_args = {
+            'model_path': args.model_path,
+            'steps': args.steps,
+            'gen_length': args.gen_length,
+            'block_length': args.block_length,
+            'temperature': args.temperature,
+            'cfg_scale': args.cfg_scale,
+            'remasking': args.remasking,
+            'logits_eos_inf': args.logits_eos_inf,
+            'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
+            'mc_samples': args.mc_samples,
+            'alpha': args.alpha,
+            'beta': args.beta,
+            'dropout_p': args.dropout_p,
+            'use_single_sample_for_remasking': args.use_single_sample_for_remasking,
+            'mask_id': 126336
+        }
+
         executor = None
         try:
             with ProcessPoolExecutor(max_workers=num_devices, initializer=worker_init) as executor:
-                futures = {executor.submit(process_batch_on_device, batch_args): batch_args['batch_idx']
-                          for batch_args in batch_args_list}
+                futures = {
+                    executor.submit(
+                        process_device_batches,
+                        {
+                            'device': device,
+                            'device_batches': per_device_batches[device],
+                            'common_args': common_args
+                        }
+                    ): device for device in devices if per_device_batches[device]
+                }
 
                 results = {}
-                with tqdm(total=len(futures), desc="Processing batches") as pbar:
+                with tqdm(total=len(futures), desc="Processing batches", position=0, leave=True) as pbar:
                     for future in as_completed(futures):
-                        idx = futures[future]
                         try:
-                            batch_output, uncertainty_history, returned_idx = future.result()
-                            results[returned_idx] = (batch_output, uncertainty_history)
+                            batch_results = future.result()
+                            for batch_idx, batch_output, uncertainty_history in batch_results:
+                                results[batch_idx] = (batch_output, uncertainty_history)
                             pbar.update(1)
                         except Exception as e:
-                            print(f"\nError processing batch {idx}: {e}")
+                            print(f"\n\n[!] Error processing device {futures[future]}: {e}")
+                            print("[!] Shutting down due to error...")
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            current_process = psutil.Process()
+                            children = current_process.children(recursive=True)
+                            for child in children:
+                                try:
+                                    child.terminate()
+                                except:
+                                    pass
                             raise
         except KeyboardInterrupt:
             print("\n\n[!] Interrupted by user (Ctrl+C). Shutting down...")
@@ -674,8 +678,6 @@ def main():
                 print("Cancelling running tasks...")
                 executor.shutdown(wait=False, cancel_futures=True)
             print("Terminating worker processes...")
-            # Force kill all child processes
-            import psutil
             current_process = psutil.Process()
             children = current_process.children(recursive=True)
             for child in children:
@@ -708,7 +710,7 @@ def main():
         if tokenizer.padding_side != 'left':
             tokenizer.padding_side = 'left'
 
-        for batch_idx in tqdm(range(0, len(all_prompts), batch_size), desc="Batch", total=num_batches):
+        for batch_idx in tqdm(range(0, len(all_prompts), batch_size), desc="Processing batches", total=num_batches, position=0, leave=True):
             batch_prompts = all_prompts[batch_idx:batch_idx + batch_size]
 
             messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]

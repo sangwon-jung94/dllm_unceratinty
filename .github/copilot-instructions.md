@@ -1,0 +1,21 @@
+# Copilot Instructions
+
+- Project: research fork of LLaDA masked discrete diffusion LM with ambiguity-aware decoding (epistemic vs aleatoric separation) for GSM8K-style math tasks.
+- Core decoding lives in [generate.py](generate.py#L19-L269); it samples masked tokens block-by-block with remasking strategies and optional classifier-free guidance.
+- MC Dropout uncertainty decomposition is centralized in [generate.py](generate.py#L19-L147) (`enable_mc_dropout`, `compute_uncertainty_decomposition`): keep `model.eval()`, toggle only `nn.Dropout` to train, compute total vs aleatoric vs epistemic, then disable dropout.
+- Unmasking score uses `-alpha * U_epi - beta * U_ale` in [generate.py](generate.py#L148-L269); `remasking='uncertainty_aware'` requires dropout layers or it falls back to low_confidence with a warning.
+- Semi-autoregressive blocks: `gen_length` is split by `block_length`; `steps` are divided per block; `get_num_transfer_tokens` precomputes how many tokens to reveal each step to match linear noise schedule.
+- Sampling noise: `add_gumbel_noise` (float64) perturbs logits; temperature 0 disables it. CFG path duplicates masked prompt slice when `cfg_scale>0`.
+- Special tokens: mask id 126336; EOS id 126081 is clamped to `-inf` when `--logits_eos_inf` (LLaDA Appendix B.4). Ensure tokenizer padding id differs from mask id (see [generate.py](generate.py#L227-L270)).
+- Remasking strategies: `low_confidence` uses per-position softmax prob of argmax; `random` uniform; `uncertainty_aware` uses uncertainty score. Confidence beyond current block is forced to `-inf` to avoid unmasking future positions.
+- Benchmark CLI: [benchmark_remasking.py](benchmark_remasking.py#L1-L175) builds `lm-eval` commands for GSM8K with `model_args` carrying `gen_length/steps/block_length/remasking/mc_samples/alpha/beta/dropout_p`; results stored under timestamped subdirs and summarized to JSON.
+- Evaluation of generated GSM8K outputs: [evaluate_gsm8k.py](evaluate_gsm8k.py#L1-L204) expects `output.txt` with `[Sample N] Question/Answer` sections; extracts boxed answers (`\boxed{}`), compares to dataset ground truth (`####`), prints accuracy, optional verbose per-sample diff.
+- Visualization & UI: [app.py](app.py#L1-L513) offers a Gradio chatbot demo; `generate_response_with_visualization` mirrors sampling logic (low_confidence/random only), supports position-locked constraints, highlights newly revealed tokens with confidence-based colors.
+- Scripts (see [scripts/README.md](scripts/README.md#L1-L91)) wrap common runs: `run_gsm8k.sh` full benchmark, `run_gsm8k_single_sample_remasking.sh` single-sample visualization, plus comparisons (MC samples, alpha/beta, remasking) and batch evaluation. All expect repo root CWD.
+- Typical experiment knobs: `--mc_samples`, `--alpha` (penalize epistemic to delay), `--beta` (penalize aleatoric to late-commit), `--dropout_p`, `--logits_eos_inf`, `--confidence_eos_eot_inf`, `--use_mc_dropout_logit`, device list (multiple GPUs space-separated in scripts).
+- Outputs land under `result/<exp_name>/` (text and `uncertainty_data.npz`, plots). Benchmark helper writes to `benchmark_results/` with lm-eval JSON trees.
+- Data formatting: GSM8K prompts follow chat template when using instruct checkpoint; left padding preferred; ensure `prompt_index` marks unmasked prompt tokens so CFG masking works.
+- Common gotchas: no dropout layers → uncertainty_aware downgrades; ensure `steps` divisible by number of blocks; adjust `block_length` ≤ `gen_length`; set `temperature`>0 only if you need stochasticity.
+- Extending: plug new remasking score in [generate.py](generate.py#L148-L269); keep entropy helpers and dropout toggling intact. For new tasks, reuse `benchmark_remasking.py` by changing `--tasks`/`model_args` as needed.
+- Tests: not a formal suite; rely on quick scripts (e.g., `run_quick_test.sh`) and GSM8K evaluation script. Consider small `--num_samples` or `--limit` for smoke tests.
+- Environment: PyTorch + transformers; requires GPU (`torch_dtype=bfloat16` assumed). Install via `pip install -r requirements.txt` at repo root.
