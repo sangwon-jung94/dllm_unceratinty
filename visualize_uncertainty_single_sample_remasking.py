@@ -9,6 +9,7 @@ remasking strategy는 단일 샘플 로짓 사용
 from transformers import AutoTokenizer, AutoModel
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 import numpy as np
 import argparse
 import os
@@ -34,22 +35,29 @@ def compute_entropy(p, dim=-1):
 
 
 def enable_mc_dropout(model, p=None):
-    """Enable dropout for MC Dropout inference"""
+    """MC Dropout을 위해 dropout 레이어 활성화"""
     dropout_count = 0
-    for module in model.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.train()
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Dropout) and not name.endswith("emb_drop"):
             if p is not None:
-                module.p = p
+                m.p = p
+            m.train()
             dropout_count += 1
+        # if m.__class__.__name__ == "LLaDALlamaBlock":
+        #     m.config.attention_dropout = p if p is not None else m.config.attention_dropout
+        #     m.train()
+        #     dropout_count += 1
     return dropout_count
 
 
 def disable_mc_dropout(model):
-    """Disable dropout after MC Dropout inference"""
-    for module in model.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.eval()
+    """Dropout 레이어 비활성화"""
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.eval()
+        if m.__class__.__name__ == "LLaDALlamaBlock":
+            m.eval()
+            m.config.attention_dropout = 0.
 
 
 def compute_uncertainty_decomposition_with_single_sample(
@@ -123,12 +131,18 @@ def compute_uncertainty_decomposition_with_single_sample(
     return mean_logits, H_epistemic, H_aleatoric, p_bar, single_logits, single_probs
 
 
-def add_gumbel_noise(logits, temperature=1.0):
-    """Add Gumbel noise to logits for sampling"""
+def add_gumbel_noise(logits, temperature):
+    '''
+    The Gumbel max is a method for sampling categorical distributions.
+    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
+    Thus, we use float64.
+    '''
     if temperature == 0:
         return logits
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
-    return logits / temperature + gumbel_noise
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    gumbel_noise = (- torch.log(noise)) ** temperature
+    return logits.exp() / gumbel_noise
 
 
 def get_num_transfer_tokens(block_mask_index, steps_per_block):
