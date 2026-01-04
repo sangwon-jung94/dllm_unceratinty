@@ -1,4 +1,18 @@
 #!/bin/bash
+#SBATCH -c 8
+#SBATCH -t 600
+#SBATCH -p seas_gpu
+#SBATCH --gres=gpu:3
+#SBATCH --mem=128000
+#SBATCH --open-mode=append
+#SBATCH -o logs/%j.out
+#SBATCH -e logs/%j.err
+#SBATCH --mail-user=sangwonjung@g.harvard.edu
+#SBATCH --mail-type=ALL
+
+module load python/3.10 cudnn cuda/12.4 gcc
+source activate RERD
+
 # Simple generation without uncertainty tracking
 
 python generate_simple.py \

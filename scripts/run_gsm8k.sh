@@ -1,4 +1,18 @@
 #!/bin/bash
+#SBATCH -c 8
+#SBATCH -t 600
+#SBATCH -p seas_gpu
+#SBATCH --gres=gpu:1
+#SBATCH --mem=128000
+#SBATCH --open-mode=append
+#SBATCH -o logs/%j.out
+#SBATCH -e logs/%j.err
+#SBATCH --mail-user=sangwonjung@g.harvard.edu
+#SBATCH --mail-type=ALL
+
+module load python/3.10 cudnn cuda/12.4 gcc
+source activate RERD
+
 # 프롬프트와 함께 실험 - GSM8K 벤치마크 전체 (1319 samples)
 # LLaDA 논문 Appendix B.4: GSM8K에서는 EOS 토큰 confidence를 0으로 설정
 
@@ -16,7 +30,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --mc_samples 6  --alpha 1.0 --beta 0.0  --dropout_p 0.2 \
     --use_mc_dropout_logit \
     --logits_eos_inf \
-    --device cuda:1 \
+    --device cuda:0 \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty_epistemic__mc6__dropout_logit__eos_inf
 end_time=$(date +%s)
@@ -37,7 +51,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --mc_samples 6  --alpha 0.0 --beta 1.0  --dropout_p 0.2 \
     --use_mc_dropout_logit \
     --logits_eos_inf \
-    --device cuda:1 \
+    --device cuda:0 \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty_aleatoric__mc6__dropout_logit__eos_inf
 end_time=$(date +%s)
@@ -58,7 +72,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --mc_samples 6  --alpha 1.0 --beta 1.0  --dropout_p 0.2 \
     --use_mc_dropout_logit \
     --logits_eos_inf \
-    --device cuda:1 \
+    --device cuda:0 \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty__mc6__dropout_logit__eos_inf
 end_time=$(date +%s)
