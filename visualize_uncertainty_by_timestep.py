@@ -124,9 +124,9 @@ def generate_with_uncertainty_tracking(
                 uncertainty_history['mean_epistemic'].append(epistemic_masked.mean().item())
                 uncertainty_history['mean_aleatoric'].append(aleatoric_masked.mean().item())
                 uncertainty_history['mean_total'].append(total_masked.mean().item())
-                uncertainty_history['std_epistemic'].append(epistemic_masked.std().item())
-                uncertainty_history['std_aleatoric'].append(aleatoric_masked.std().item())
-                uncertainty_history['std_total'].append(total_masked.std().item())
+                uncertainty_history['std_epistemic'].append(epistemic_masked.std(unbiased=False).item())
+                uncertainty_history['std_aleatoric'].append(aleatoric_masked.std(unbiased=False).item())
+                uncertainty_history['std_total'].append(total_masked.std(unbiased=False).item())
             
             # Get logits for actual token sampling
             # Use MC dropout logits or clean logits based on use_mc_dropout_logit option
@@ -205,9 +205,9 @@ def generate_with_uncertainty_tracking(
                 uncertainty_history['mean_epistemic_unmasked'].append(epistemic_unmasked.mean().item())
                 uncertainty_history['mean_aleatoric_unmasked'].append(aleatoric_unmasked.mean().item())
                 uncertainty_history['mean_total_unmasked'].append(total_unmasked.mean().item())
-                uncertainty_history['std_epistemic_unmasked'].append(epistemic_unmasked.std().item())
-                uncertainty_history['std_aleatoric_unmasked'].append(aleatoric_unmasked.std().item())
-                uncertainty_history['std_total_unmasked'].append(total_unmasked.std().item())
+                uncertainty_history['std_epistemic_unmasked'].append(epistemic_unmasked.std(unbiased=False).item())
+                uncertainty_history['std_aleatoric_unmasked'].append(aleatoric_unmasked.std(unbiased=False).item())
+                uncertainty_history['std_total_unmasked'].append(total_unmasked.std(unbiased=False).item())
             else:
                 # No tokens unmasked in this step (shouldn't happen but just in case)
                 uncertainty_history['mean_epistemic_unmasked'].append(0.0)
