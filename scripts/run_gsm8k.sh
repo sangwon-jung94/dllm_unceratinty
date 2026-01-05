@@ -7,7 +7,7 @@
 #SBATCH --open-mode=append
 #SBATCH -o logs/%j.out
 #SBATCH -e logs/%j.err
-#SBATCH --mail-user=sangwonjung@g.harvard.edu
+#SBATCH --mail-user=s.jung@g.harvard.edu
 #SBATCH --mail-type=ALL
 
 module load python/3.10 cudnn cuda/12.4 gcc
