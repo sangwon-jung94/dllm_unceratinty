@@ -3,8 +3,9 @@
 remasking strategy는 단일 샘플 로짓 사용
 
 차이점:
-- 샘플링: 앙상블된 mean_logits 사용 (기존과 동일)
-- Remasking: 앙상블 되기 전 마지막 단일 샘플의 로짓/확률 사용
+- 샘플링: 기본은 앙상블 mean_logits, 옵션으로 단일 샘플 로짓 사용 가능
+- Remasking: 기본은 단일 샘플 로짓/확률, 옵션으로 앙상블 사용 가능
+- EnsembleLLaDA 지원 (num_ensembles=mc_samples)
 """
 from transformers import AutoTokenizer, AutoModel
 import torch
@@ -22,6 +23,9 @@ import signal
 import sys
 from tqdm import tqdm
 import psutil
+
+from models.EnsembleLLaDA import get_ensemble_model
+from generate import is_ensemble_model
 
 
 def compute_entropy(p, dim=-1):
@@ -64,69 +68,114 @@ def compute_uncertainty_decomposition_with_single_sample(
     model, x, attention_mask, mc_samples, cfg_scale, prompt_index, mask_id, dropout_p=None
 ):
     """
-    MC Dropout으로 epistemic/aleatoric uncertainty 계산하되,
-    마지막 단일 샘플의 로짓과 확률도 함께 리턴
-    
+    MC Dropout 또는 EnsembleLLaDA로 epistemic/aleatoric uncertainty 계산.
+    마지막 단일 샘플의 로짓/확률도 반환해 remasking·sampling에 활용.
+
     Returns:
-        mean_logits: MC 샘플들의 평균 로짓 (앙상블)
+        mean_logits: MC/Ensemble 평균 로짓
         H_epistemic: Epistemic uncertainty
         H_aleatoric: Aleatoric uncertainty
         p_bar: 평균 확률 분포 (앙상블)
-        single_logits: 마지막 MC 샘플의 로짓 (단일)
-        single_probs: 마지막 MC 샘플의 확률 분포 (단일)
+        single_logits: 마지막 샘플 로짓 (단일)
+        single_probs: 마지막 샘플 확률 (단일)
     """
-    probs_sum = None
-    entropy_sum = None
-    logits_sum = None
-    single_logits = None
-    single_probs = None
+    use_ensemble = is_ensemble_model(model)
 
-    dropout_count = enable_mc_dropout(model, p=dropout_p)
+    if use_ensemble:
+        # EnsembleLLaDA: 단일 forward에 num_ensembles=mc_samples 전달
+        last_block = model.model.transformer.blocks[-1]
+        prev_training = last_block.mlp_dropout.training
+        prev_p = getattr(last_block.mlp_dropout, 'p', None)
+        last_block.mlp_dropout.train()
+        if dropout_p is not None and prev_p is not None:
+            last_block.mlp_dropout.p = dropout_p
 
-    try:
-        for k in range(mc_samples):
+        try:
             if cfg_scale > 0.:
                 un_x = x.clone()
                 un_x[prompt_index] = mask_id
                 x_ = torch.cat([x, un_x], dim=0)
                 if attention_mask is not None:
                     attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
-                    logits = model(x_, attention_mask=attention_mask_).logits
+                    logits_ensemble = model.model(x_, attention_mask=attention_mask_, num_ensembles=mc_samples).logits
                 else:
-                    logits = model(x_).logits
-                logits, un_logits = torch.chunk(logits, 2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    logits_ensemble = model.model(x_, num_ensembles=mc_samples).logits
+                logits_ensemble, un_logits_ensemble = torch.chunk(logits_ensemble, 2, dim=1)
+                logits_ensemble = un_logits_ensemble + (cfg_scale + 1) * (logits_ensemble - un_logits_ensemble)
             else:
                 if attention_mask is not None:
-                    logits = model(x, attention_mask=attention_mask).logits
+                    logits_ensemble = model.model(x, attention_mask=attention_mask, num_ensembles=mc_samples).logits
                 else:
-                    logits = model(x).logits
+                    logits_ensemble = model.model(x, num_ensembles=mc_samples).logits
+        finally:
+            if not prev_training:
+                last_block.mlp_dropout.eval()
+            if prev_p is not None:
+                last_block.mlp_dropout.p = prev_p
 
-            p = F.softmax(logits, dim=-1)
-            h_k = compute_entropy(p, dim=-1)
+        probs_ensemble = F.softmax(logits_ensemble, dim=-1)
+        entropy_ensemble = compute_entropy(probs_ensemble, dim=-1)
 
-            # 마지막 샘플 저장 (단일 샘플용)
-            single_logits = logits.clone()
-            single_probs = p.clone()
+        p_bar = probs_ensemble.mean(dim=0)
+        mean_logits = logits_ensemble.mean(dim=0)
+        H_total = compute_entropy(p_bar, dim=-1)
+        H_aleatoric = entropy_ensemble.mean(dim=0)
+        H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)
 
-            if probs_sum is None:
-                probs_sum = p.clone()
-                entropy_sum = h_k.clone()
-                logits_sum = logits.clone()
-            else:
-                probs_sum = probs_sum + p
-                entropy_sum = entropy_sum + h_k
-                logits_sum = logits_sum + logits
-    except Exception as e:
-        raise e
-    finally:
-        disable_mc_dropout(model)
+        # 마지막 ensemble 멤버를 단일 샘플로 사용
+        single_logits = logits_ensemble[-1].clone()
+        single_probs = probs_ensemble[-1].clone()
 
-    p_bar = probs_sum / mc_samples
-    mean_logits = logits_sum / mc_samples
-    H_total = compute_entropy(p_bar, dim=-1)
-    H_aleatoric = entropy_sum / mc_samples
-    H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)
+    else:
+        probs_sum = None
+        entropy_sum = None
+        logits_sum = None
+        single_logits = None
+        single_probs = None
+
+        enable_mc_dropout(model, p=dropout_p)
+
+        try:
+            for k in range(mc_samples):
+                if cfg_scale > 0.:
+                    un_x = x.clone()
+                    un_x[prompt_index] = mask_id
+                    x_ = torch.cat([x, un_x], dim=0)
+                    if attention_mask is not None:
+                        attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
+                        logits = model(x_, attention_mask=attention_mask_).logits
+                    else:
+                        logits = model(x_).logits
+                    logits, un_logits = torch.chunk(logits, 2, dim=0)
+                    logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                else:
+                    if attention_mask is not None:
+                        logits = model(x, attention_mask=attention_mask).logits
+                    else:
+                        logits = model(x).logits
+
+                p = F.softmax(logits, dim=-1)
+                h_k = compute_entropy(p, dim=-1)
+
+                single_logits = logits.clone()
+                single_probs = p.clone()
+
+                if probs_sum is None:
+                    probs_sum = p.clone()
+                    entropy_sum = h_k.clone()
+                    logits_sum = logits.clone()
+                else:
+                    probs_sum = probs_sum + p
+                    entropy_sum = entropy_sum + h_k
+                    logits_sum = logits_sum + logits
+        finally:
+            disable_mc_dropout(model)
+
+        p_bar = probs_sum / mc_samples
+        mean_logits = logits_sum / mc_samples
+        H_total = compute_entropy(p_bar, dim=-1)
+        H_aleatoric = entropy_sum / mc_samples
+        H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)
 
     return mean_logits, H_epistemic, H_aleatoric, p_bar, single_logits, single_probs
 
@@ -183,12 +232,13 @@ def generate_with_single_sample_remasking(
     alpha=1.0, 
     beta=1.0, 
     dropout_p=None,
-    use_single_sample_for_remasking=True
+    use_single_sample_for_remasking=True,
+    use_single_sample_for_sampling=False
 ):
     '''
     실험용 생성 함수:
-    - 샘플링은 앙상블된 로짓 사용
-    - Remasking은 단일 샘플 로짓 사용 (use_single_sample_for_remasking=True인 경우)
+    - 샘플링: 기본은 앙상블 평균, 옵션으로 단일 샘플 로짓 사용
+    - Remasking: 기본은 단일 샘플 로짓, 옵션으로 앙상블 사용
     
     Returns:
         x: Generated sequences
@@ -268,8 +318,8 @@ def generate_with_single_sample_remasking(
                 uncertainty_history['std_aleatoric'].append(aleatoric_masked.std().item())
                 uncertainty_history['std_total'].append(total_masked.std().item())
             
-            # **핵심 차이점**: 샘플링은 앙상블 로짓 사용
-            logits_for_sampling = mean_logits_mc
+            # 샘플링 로짓 선택: 앙상블(평균) vs 단일 샘플
+            logits_for_sampling = single_logits if use_single_sample_for_sampling else mean_logits_mc
             
             if logits_eos_inf:
                 logits_for_sampling[:, :, 126081] = -torch.inf
@@ -302,6 +352,10 @@ def generate_with_single_sample_remasking(
                     torch.gather(probs_for_remasking, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
             elif remasking == 'random':
                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+            elif remasking == 'entropy':
+                # 낮은 엔트로피(높은 확신) 먼저 언마스크되도록 음수 부호를 적용
+                entropy = compute_entropy(probs_for_remasking, dim=-1)
+                x0_p = -entropy
             
             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
@@ -406,11 +460,18 @@ def process_device_batches(args_dict):
     if device != 'cpu':
         torch.cuda.set_device(device)
 
-    model = AutoModel.from_pretrained(
-        common_args['model_path'],
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16
-    ).to(device).eval()
+    if common_args.get('use_ensemble_model', False):
+        model = get_ensemble_model(
+            common_args['model_path'],
+            mlp_dropout_p=common_args.get('dropout_p'),
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
+    else:
+        model = AutoModel.from_pretrained(
+            common_args['model_path'],
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
         common_args['model_path'],
@@ -455,7 +516,8 @@ def process_device_batches(args_dict):
             alpha=common_args['alpha'],
             beta=common_args['beta'],
             dropout_p=common_args['dropout_p'],
-            use_single_sample_for_remasking=common_args['use_single_sample_for_remasking']
+            use_single_sample_for_remasking=common_args['use_single_sample_for_remasking'],
+            use_single_sample_for_sampling=common_args['use_single_sample_for_sampling']
         )
 
         batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
@@ -507,7 +569,7 @@ def main():
     
     # Uncertainty estimation parameters
     parser.add_argument('--remasking', type=str, default='low_confidence',
-                        choices=['uncertainty_aware', 'low_confidence', 'random'],
+                        choices=['uncertainty_aware', 'low_confidence', 'random', 'entropy'],
                         help='Remasking strategy')
     parser.add_argument('--mc_samples', type=int, default=4,
                         help='Number of MC Dropout samples')
@@ -519,6 +581,10 @@ def main():
                         help='Dropout probability for MC Dropout')
     parser.add_argument('--use_mc_dropout_logit', action='store_true',
                         help='(Compatibility) Accept flag; logits already use MC dropout by design')
+
+    # EnsembleLLaDA settings
+    parser.add_argument('--use_ensemble_model', action='store_true',
+                        help='Use EnsembleLLaDA (last-layer MLP ensemble). mc_samples controls num_ensembles.')
     
     # Experiment toggle
     parser.add_argument('--use_single_sample_for_remasking', action='store_true',
@@ -527,6 +593,13 @@ def main():
                         action='store_false',
                         help='Use ensemble logits for remasking (baseline)')
     parser.set_defaults(use_single_sample_for_remasking=True)
+
+    parser.add_argument('--use_single_sample_for_sampling', action='store_true',
+                        help='Use the final MC sample logits for token sampling instead of ensemble mean')
+    parser.add_argument('--use_ensemble_for_sampling', dest='use_single_sample_for_sampling',
+                        action='store_false',
+                        help='Use ensemble mean logits for sampling (default)')
+    parser.set_defaults(use_single_sample_for_sampling=False)
     
     # EOS token handling
     parser.add_argument('--logits_eos_inf', action='store_true',
@@ -559,8 +632,10 @@ def main():
     # Generate experiment name if not provided
     if args.exp_name is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        remasking_type = 'single_sample' if args.use_single_sample_for_remasking else 'ensemble'
-        args.exp_name = f'experiment_{args.remasking}_{remasking_type}_{timestamp}'
+        remasking_type = 'single_remask' if args.use_single_sample_for_remasking else 'ensemble_remask'
+        sampling_type = 'single_sample_sampling' if args.use_single_sample_for_sampling else 'ensemble_sampling'
+        ensemble_suffix = 'ensemble_model' if args.use_ensemble_model else 'base_model'
+        args.exp_name = f'experiment_{args.remasking}_{remasking_type}_{sampling_type}_{ensemble_suffix}_{timestamp}'
     
     # Create experiment-specific output directory
     exp_output_dir = os.path.join(args.output_dir, args.exp_name)
@@ -604,9 +679,13 @@ def main():
     print(f"Device(s): {devices} ({num_devices} device{'s' if num_devices > 1 else ''})")
     print(f"Batch size: {batch_size}")
     print(f"Model: {args.model_path}")
+    if args.use_ensemble_model:
+        dropout_str = f"{args.dropout_p}" if args.dropout_p is not None else "config.residual_dropout"
+        print(f"Using EnsembleLLaDA: True (last-layer MLP dropout: {dropout_str})")
     print(f"Remasking Strategy: {args.remasking}")
     print(f"MC Samples: {args.mc_samples}, Dropout: {args.dropout_p}")
     print(f"Use Single Sample for Remasking: {args.use_single_sample_for_remasking}")
+    print(f"Use Single Sample for Sampling: {args.use_single_sample_for_sampling}")
     print("=" * 80)
     if args.use_prompt:
         print(f"\nBenchmark: {args.benchmark}")
@@ -649,6 +728,8 @@ def main():
             'beta': args.beta,
             'dropout_p': args.dropout_p,
             'use_single_sample_for_remasking': args.use_single_sample_for_remasking,
+            'use_single_sample_for_sampling': args.use_single_sample_for_sampling,
+            'use_ensemble_model': args.use_ensemble_model,
             'mask_id': 126336
         }
 
@@ -710,11 +791,18 @@ def main():
     else:
         device = devices[0]
         print("\nLoading model...")
-        model = AutoModel.from_pretrained(
-            args.model_path, 
-            trust_remote_code=True, 
-            torch_dtype=torch.bfloat16
-        ).to(device).eval()
+        if args.use_ensemble_model:
+            model = get_ensemble_model(
+                args.model_path,
+                mlp_dropout_p=args.dropout_p,
+                torch_dtype=torch.bfloat16
+            ).to(device).eval()
+        else:
+            model = AutoModel.from_pretrained(
+                args.model_path, 
+                trust_remote_code=True, 
+                torch_dtype=torch.bfloat16
+            ).to(device).eval()
         
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_path, 
@@ -758,7 +846,8 @@ def main():
                 alpha=args.alpha,
                 beta=args.beta,
                 dropout_p=args.dropout_p,
-                use_single_sample_for_remasking=args.use_single_sample_for_remasking
+                use_single_sample_for_remasking=args.use_single_sample_for_remasking,
+                use_single_sample_for_sampling=args.use_single_sample_for_sampling
             )
 
             batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
@@ -796,7 +885,9 @@ def main():
     text_output_path = os.path.join(exp_output_dir, 'output.txt')
     with open(text_output_path, 'w') as f:
         f.write(f"Experiment: {args.exp_name}\n")
+        f.write(f"Use Ensemble Model: {args.use_ensemble_model}\n")
         f.write(f"Use Single Sample for Remasking: {args.use_single_sample_for_remasking}\n")
+        f.write(f"Use Single Sample for Sampling: {args.use_single_sample_for_sampling}\n")
         f.write(f"Remasking Strategy: {args.remasking}\n")
         f.write(f"MC Samples: {args.mc_samples}, Dropout: {args.dropout_p}\n")
         f.write(f"Prompt: {args.prompt}\n")
@@ -816,7 +907,9 @@ def main():
     # Create visualization
     print("\nCreating visualization...")
     plot_path = os.path.join(exp_output_dir, 'uncertainty_over_timesteps.png')
-    title_suffix = f"Remasking: {args.remasking} ({'Single Sample' if args.use_single_sample_for_remasking else 'Ensemble'})"
+    remask_desc = 'Single Sample' if args.use_single_sample_for_remasking else 'Ensemble'
+    sampling_desc = 'Single Sample' if args.use_single_sample_for_sampling else 'Ensemble'
+    title_suffix = f"Remasking: {args.remasking} ({remask_desc}) | Sampling: {sampling_desc}"
     plot_uncertainty_over_time(uncertainty_history, plot_path, title_suffix)
     
     print("\n" + "=" * 80)
