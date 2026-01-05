@@ -103,20 +103,37 @@ def parse_output_file(output_file, max_samples=None):
     # [Sample N] 으로 구분되는 섹션 찾기
     sample_pattern = r'\[Sample (\d+)\]\s*Question:\s*(.*?)\s*Answer:\s*(.*?)(?=\[Sample \d+\]|$)'
     matches = re.findall(sample_pattern, content, re.DOTALL)
-    
-    for sample_num, question, answer in matches:
-        # 구분선 제거
-        answer = re.sub(r'-{10,}', '', answer).strip()
-        
-        samples.append({
-            'sample_num': int(sample_num),
-            'question': question.strip(),
-            'answer': answer.strip()
-        })
-        
-        # max_samples 제한
-        if max_samples is not None and len(samples) >= max_samples:
-            break
+
+    if matches:
+        for sample_num, question, answer in matches:
+            # 구분선 제거
+            answer = re.sub(r'-{10,}', '', answer).strip()
+
+            samples.append({
+                'sample_num': int(sample_num),
+                'question': question.strip(),
+                'answer': answer.strip()
+            })
+
+            # max_samples 제한
+            if max_samples is not None and len(samples) >= max_samples:
+                break
+    else:
+        # Question/Answer 라벨이 없는 형식: [Sample N] 이후 전체 블록을 답변으로 처리
+        fallback_pattern = r'\[Sample (\d+)\]\s*(.*?)(?=\n\s*\[Sample \d+\]|$)'
+        matches = re.findall(fallback_pattern, content, flags=re.DOTALL)
+
+        for sample_num, answer_block in matches:
+            cleaned_answer = re.sub(r'-{10,}', '', answer_block).strip()
+
+            samples.append({
+                'sample_num': int(sample_num),
+                'question': '',
+                'answer': cleaned_answer
+            })
+
+            if max_samples is not None and len(samples) >= max_samples:
+                break
     
     return samples
 
@@ -146,7 +163,7 @@ def evaluate_gsm8k(output_file, verbose=False, max_samples=None):
     correct = 0
     total = len(samples)
     results = []
-    
+    printed = 0
     for i, sample in enumerate(samples):
         sample_idx = sample['sample_num'] - 1  # 0-based index
         
@@ -170,16 +187,18 @@ def evaluate_gsm8k(output_file, verbose=False, max_samples=None):
         if is_correct:
             correct += 1
         
+        question_text = sample['question'] or dataset[sample_idx].get('question', '')
+
         result = {
             'sample_num': sample['sample_num'],
-            'question': sample['question'][:100] + '...',  # 처음 100자만
+            'question': question_text[:100] + '...',  # 처음 100자만
             'ground_truth': ground_truth_answer,
             'predicted': predicted_answer,
             'correct': is_correct
         }
         results.append(result)
         
-        if verbose or not is_correct:
+        if verbose or not is_correct and printed < 10:
             status = "✓" if is_correct else "✗"
             print(f"\n{status} Sample {sample['sample_num']}:")
             print(f"  Question: {result['question']}")
@@ -188,6 +207,7 @@ def evaluate_gsm8k(output_file, verbose=False, max_samples=None):
             if not is_correct:
                 print(f"  Normalized GT: {ground_truth_norm}")
                 print(f"  Normalized Pred: {predicted_norm}")
+            printed += 1
     
     # 통계 계산
     accuracy = (correct / total * 100) if total > 0 else 0

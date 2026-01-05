@@ -10,6 +10,7 @@ from generate import (
     compute_uncertainty_score,
     compute_entropy
 )
+from models.EnsembleLLaDA import get_ensemble_model
 import torch.nn.functional as F
 import argparse
 import os
@@ -314,6 +315,52 @@ def plot_uncertainty_components(uncertainty_history, save_path='uncertainty_comp
     plt.close()
 
 
+def plot_uncertainty_ratio(uncertainty_history, save_path='uncertainty_ratio.png', title_suffix=''):
+    '''
+    Plot aleatoric/epistemic uncertainty ratio over diffusion timesteps.
+    
+    Args:
+        uncertainty_history: Dict containing timestep-wise uncertainty metrics
+        save_path: Path to save the plot
+        title_suffix: Additional text to add to the title
+    '''
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    timesteps = uncertainty_history['timesteps']
+    
+    # Compute ratio, avoiding division by zero
+    mean_epistemic = np.array(uncertainty_history['mean_epistemic'])
+    mean_aleatoric = np.array(uncertainty_history['mean_aleatoric'])
+    
+    # Add small epsilon to avoid division by zero
+    ratio = mean_aleatoric / (mean_epistemic + 1e-8)
+    
+    # Plot ratio
+    ax.plot(timesteps, ratio, 
+            label='Aleatoric / Epistemic Ratio', linewidth=2.5, marker='o', markersize=4, 
+            color='#d62728', alpha=0.9)
+    
+    # Add horizontal line at y=1 for reference
+    ax.axhline(y=1.0, color='gray', linestyle='--', linewidth=1.5, alpha=0.5, label='Ratio = 1 (Equal)')
+    
+    ax.set_xlabel('Diffusion Timestep (t)', fontsize=12)
+    ax.set_ylabel('Aleatoric / Epistemic Ratio', fontsize=12)
+    title = 'Aleatoric vs Epistemic Uncertainty Ratio Over Diffusion Process'
+    if title_suffix:
+        title += f'\n{title_suffix}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    # Use log scale if ratio varies widely
+    ax.set_yscale('log')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Plot saved to: {save_path}")
+    plt.close()
+
+
 def get_benchmark_prompts(benchmark_name, num_samples=None):
     '''
     Load prompts from various benchmarks used in eval_llada.py
@@ -380,11 +427,18 @@ def process_device_batches(args_dict):
     if device != 'cpu':
         torch.cuda.set_device(device)
     
-    model = AutoModel.from_pretrained(
-        common_args['model_path'], 
-        trust_remote_code=True, 
-        torch_dtype=torch.bfloat16
-    ).to(device).eval()
+    if common_args.get('use_ensemble_model', False):
+        model = get_ensemble_model(
+            common_args['model_path'],
+            mlp_dropout_p=common_args.get('dropout_p'),
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
+    else:
+        model = AutoModel.from_pretrained(
+            common_args['model_path'], 
+            trust_remote_code=True, 
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
     
     tokenizer = AutoTokenizer.from_pretrained(
         common_args['model_path'], 
@@ -502,6 +556,10 @@ def main():
     parser.add_argument('--use_mc_dropout_logit', action='store_true',
                         help='Use MC dropout averaged logits for sampling instead of clean logits (may reduce generation quality)')
     
+    # EnsembleLLaDA settings
+    parser.add_argument('--use_ensemble_model', action='store_true',
+                        help='Use EnsembleLLaDA model (replaces last layer MLP with separate dropout controlled by --dropout_p)')
+    
     # EOS token handling (from LLaDA paper Appendix B.4)
     parser.add_argument('--logits_eos_inf', action='store_true',
                         help='Set EOS token logits to -inf to prevent early termination')
@@ -568,6 +626,13 @@ def main():
     if args.remasking == 'uncertainty_aware':
         print(f"MC Samples: {args.mc_samples}, Alpha: {args.alpha}, Beta: {args.beta}, Dropout: {args.dropout_p}")
         print(f"Use MC Dropout Logit for Sampling: {args.use_mc_dropout_logit}")
+    if args.use_ensemble_model:
+        dropout_str = f"{args.dropout_p}" if args.dropout_p is not None else "config.residual_dropout"
+        print(f"Using EnsembleLLaDA: True (last layer MLP dropout: {dropout_str})")
+        if args.remasking == 'uncertainty_aware':
+            print(f"  → Uncertainty computed via SINGLE forward pass with num_ensembles={args.mc_samples}")
+    elif args.remasking == 'uncertainty_aware':
+        print(f"  → Uncertainty computed via {args.mc_samples} separate forward passes (standard MC Dropout)")
     print(f"Use Prompt: {args.use_prompt}")
     if args.use_prompt:
         print(f"Benchmark: {args.benchmark}")
@@ -581,11 +646,19 @@ def main():
         # Original single-device code path
         device = devices[0]
         print("\nLoading model...")
-        model = AutoModel.from_pretrained(
-            args.model_path, 
-            trust_remote_code=True, 
-            torch_dtype=torch.bfloat16
-        ).to(device).eval()
+        if args.use_ensemble_model:
+            print("Using EnsembleLLaDA model...")
+            model = get_ensemble_model(
+                args.model_path,
+                mlp_dropout_p=args.dropout_p,
+                torch_dtype=torch.bfloat16
+            ).to(device).eval()
+        else:
+            model = AutoModel.from_pretrained(
+                args.model_path, 
+                trust_remote_code=True, 
+                torch_dtype=torch.bfloat16
+            ).to(device).eval()
         
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_path, 
@@ -648,6 +721,7 @@ def main():
                 'beta': args.beta,
                 'dropout_p': args.dropout_p,
                 'use_mc_dropout_logit': args.use_mc_dropout_logit,
+                'use_ensemble_model': args.use_ensemble_model,
                 'use_prompt': args.use_prompt
             }
             
@@ -775,11 +849,19 @@ def main():
             # Load model if not already loaded
             if 'model' not in locals():
                 print("\nLoading model...")
-                model = AutoModel.from_pretrained(
-                    args.model_path, 
-                    trust_remote_code=True, 
-                    torch_dtype=torch.bfloat16
-                ).to(device).eval()
+                if args.use_ensemble_model:
+                    print("Using EnsembleLLaDA model...")
+                    model = get_ensemble_model(
+                        args.model_path,
+                        mlp_dropout_p=args.dropout_p,
+                        torch_dtype=torch.bfloat16
+                    ).to(device).eval()
+                else:
+                    model = AutoModel.from_pretrained(
+                        args.model_path, 
+                        trust_remote_code=True, 
+                        torch_dtype=torch.bfloat16
+                    ).to(device).eval()
                 
                 tokenizer = AutoTokenizer.from_pretrained(
                     args.model_path, 
@@ -914,6 +996,10 @@ def main():
     plot2_path = os.path.join(exp_output_dir, 'uncertainty_components.png')
     plot_uncertainty_components(uncertainty_history, plot2_path, title_suffix)
     
+    # Plot 3: Aleatoric/Epistemic ratio
+    plot_ratio_path = os.path.join(exp_output_dir, 'uncertainty_ratio.png')
+    plot_uncertainty_ratio(uncertainty_history, plot_ratio_path, title_suffix)
+    
     # Additional plots for uncertainty_aware mode: same plots but for unmasked tokens only
     if args.remasking == 'uncertainty_aware':
         print("\n** Creating additional plots for unmasked tokens (uncertainty_aware mode)...")
@@ -937,6 +1023,10 @@ def main():
         # Plot 4: Unmasked tokens - components
         plot4_path = os.path.join(exp_output_dir, 'uncertainty_components_unmasked.png')
         plot_uncertainty_components(unmasked_history, plot4_path, unmasked_title_suffix)
+        
+        # Plot 5: Unmasked tokens - ratio
+        plot5_path = os.path.join(exp_output_dir, 'uncertainty_ratio_unmasked.png')
+        plot_uncertainty_ratio(unmasked_history, plot5_path, unmasked_title_suffix)
     
     print("\n" + "=" * 80)
     print("All outputs saved to:", exp_output_dir)

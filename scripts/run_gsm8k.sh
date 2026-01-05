@@ -21,18 +21,19 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 32 \
+    --batch_size 2 \
     --num_samples 256 \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
     --remasking uncertainty_aware \
-    --mc_samples 6  --alpha 1.0 --beta 0.0  --dropout_p 0.2 \
+    --mc_samples 6  --alpha 1.0 --beta 0.0  --dropout_p 0.1 \
     --use_mc_dropout_logit \
     --logits_eos_inf \
-    --device cuda:0 \
+    --device cuda:0 cuda:1 cuda:2 cuda:3 cuda:4 cuda:5 \
+    --use_ensemble_model \
     --output_dir ./result \
-    --exp_name gsm8k_uncertainty_epistemic__mc6__dropout_logit__eos_inf
+    --exp_name gsm8k_uncertainty_epistemic__mc6__only_last_layer__dropout_logit__eos_inf
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))
 
@@ -42,40 +43,21 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 32 \
+    --batch_size 2 \
     --num_samples 256 \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
     --remasking uncertainty_aware \
-    --mc_samples 6  --alpha 0.0 --beta 1.0  --dropout_p 0.2 \
+    --mc_samples 6  --alpha 0.0 --beta 1.0  --dropout_p 0.1 \
     --use_mc_dropout_logit \
     --logits_eos_inf \
-    --device cuda:0 \
+    --device cuda:0 cuda:1 cuda:2 cuda:3 cuda:4 cuda:5 \
+    --use_ensemble_model \
     --output_dir ./result \
-    --exp_name gsm8k_uncertainty_aleatoric__mc6__dropout_logit__eos_inf
+    --exp_name gsm8k_uncertainty_aleatoric__mc6__only_last_layer__dropout_logit__eos_inf
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))
 
 echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
-start_time=$(date +%s)
-python3 visualize_uncertainty_by_timestep.py \
-    --use_prompt \
-    --benchmark gsm8k \
-    --batch_size 32 \
-    --num_samples 256 \
-    --steps 256 \
-    --gen_length 256 \
-    --block_length 256 \
-    --remasking uncertainty_aware \
-    --mc_samples 6  --alpha 1.0 --beta 1.0  --dropout_p 0.2 \
-    --use_mc_dropout_logit \
-    --logits_eos_inf \
-    --device cuda:0 \
-    --output_dir ./result \
-    --exp_name gsm8k_uncertainty__mc6__dropout_logit__eos_inf
-end_time=$(date +%s)
-elapsed=$((end_time - start_time))
-
-echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"

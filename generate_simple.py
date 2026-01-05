@@ -8,6 +8,7 @@ from generate import (
     enable_mc_dropout,
     disable_mc_dropout,
 )
+from models.EnsembleLLaDA import get_ensemble_model
 import torch.nn.functional as F
 import argparse
 import os
@@ -197,11 +198,18 @@ def process_device_batches(args_dict):
     if device != 'cpu':
         torch.cuda.set_device(device)
 
-    model = AutoModel.from_pretrained(
-        common_args['model_path'], 
-        trust_remote_code=True, 
-        torch_dtype=torch.bfloat16
-    ).to(device).eval()
+    if common_args.get('use_ensemble_model', False):
+        model = get_ensemble_model(
+            common_args['model_path'],
+            mlp_dropout_p=common_args.get('dropout_p'),
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
+    else:
+        model = AutoModel.from_pretrained(
+            common_args['model_path'], 
+            trust_remote_code=True, 
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
         common_args['model_path'], 
@@ -282,7 +290,10 @@ def main():
                         help='Remasking strategy (uncertainty_aware not supported)')
 
     parser.add_argument('--dropout_p', type=float, default=None,
-                        help='Dropout probability to set (if None, uses model default)')
+                        help='Dropout probability to set (used for MC dropout and EnsembleLLaDA MLP; None uses model default)')
+
+    parser.add_argument('--use_ensemble_model', action='store_true',
+                        help='Use EnsembleLLaDA model (last-layer MLP dropout controlled by --dropout_p)')
     
     # EOS token handling
     parser.add_argument('--logits_eos_inf', action='store_true',
@@ -347,6 +358,9 @@ def main():
     print(f"Model: {args.model_path}")
     print(f"Steps: {args.steps}, Gen Length: {args.gen_length}, Block Length: {args.block_length}")
     print(f"Remasking Strategy: {args.remasking}")
+    if args.use_ensemble_model:
+        dropout_str = f"{args.dropout_p}" if args.dropout_p is not None else "config.residual_dropout"
+        print(f"Using EnsembleLLaDA: True (last layer MLP dropout: {dropout_str})")
     print(f"Use Prompt: {args.use_prompt}")
     if args.use_prompt:
         print(f"Benchmark: {args.benchmark}")
@@ -355,11 +369,19 @@ def main():
     if not use_parallel:
         device = devices[0]
         print("\nLoading model...")
-        model = AutoModel.from_pretrained(
-            args.model_path, 
-            trust_remote_code=True, 
-            torch_dtype=torch.bfloat16
-        ).to(device).eval()
+        if args.use_ensemble_model:
+            print("Using EnsembleLLaDA model...")
+            model = get_ensemble_model(
+                args.model_path,
+                mlp_dropout_p=args.dropout_p,
+                torch_dtype=torch.bfloat16
+            ).to(device).eval()
+        else:
+            model = AutoModel.from_pretrained(
+                args.model_path, 
+                trust_remote_code=True, 
+                torch_dtype=torch.bfloat16
+            ).to(device).eval()
         
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_path, 
@@ -412,7 +434,8 @@ def main():
                 'remasking': args.remasking,
                 'logits_eos_inf': args.logits_eos_inf,
                 'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
-                'dropout_p': args.dropout_p
+                'dropout_p': args.dropout_p,
+                'use_ensemble_model': args.use_ensemble_model
             }
 
             try:
@@ -500,11 +523,19 @@ def main():
             device = devices[0]
             if 'model' not in locals():
                 print("\nLoading model...")
-                model = AutoModel.from_pretrained(
-                    args.model_path, 
-                    trust_remote_code=True, 
-                    torch_dtype=torch.bfloat16
-                ).to(device).eval()
+                if args.use_ensemble_model:
+                    print("Using EnsembleLLaDA model...")
+                    model = get_ensemble_model(
+                        args.model_path,
+                        mlp_dropout_p=args.dropout_p,
+                        torch_dtype=torch.bfloat16
+                    ).to(device).eval()
+                else:
+                    model = AutoModel.from_pretrained(
+                        args.model_path, 
+                        trust_remote_code=True, 
+                        torch_dtype=torch.bfloat16
+                    ).to(device).eval()
                 tokenizer = AutoTokenizer.from_pretrained(
                     args.model_path, 
                     trust_remote_code=True

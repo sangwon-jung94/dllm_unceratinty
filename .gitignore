@@ -1,3 +1,4 @@
 result/
 sampling_analysis/
 .vscode/
+__pycache__/

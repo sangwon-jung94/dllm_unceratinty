@@ -75,9 +75,24 @@ def compute_entropy(probs, dim=-1, eps=1e-9):
     return (-probs * probs.clamp_min(eps).log()).sum(dim=dim)
 
 
+def is_ensemble_model(model):
+    """
+    Check if the model is using EnsembleLLaDABlock for the last layer.
+    """
+    try:
+        from models.EnsembleLLaDA import EnsembleLLaDABlock
+        last_block = model.model.transformer.blocks[-1]
+        return isinstance(last_block, EnsembleLLaDABlock)
+    except (ImportError, AttributeError):
+        return False
+
+
 def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_scale, prompt_index, mask_id, dropout_p=None):
     """
     Compute epistemic and aleatoric uncertainty via MC Dropout.
+    
+    If using EnsembleLLaDA, performs a single forward pass with num_ensembles=mc_samples.
+    Otherwise, performs mc_samples forward passes with dropout enabled.
 
     Args:
         dropout_p: Dropout probability for MC Dropout. If None, uses existing layer probabilities.
@@ -85,53 +100,101 @@ def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_
     Returns:
         Tuple of (mean_logits, epistemic_uncertainty, aleatoric_uncertainty, mean_probs)
     """
-    probs_sum = None
-    entropy_sum = None
-    logits_sum = None
+    use_ensemble = is_ensemble_model(model)
+    
+    if use_ensemble:
+        # EnsembleLLaDA: Single forward pass with num_ensembles=mc_samples
+        # Ensure last-layer MLP dropout is active (train mode) to sample different masks
+        last_block = model.model.transformer.blocks[-1]
+        prev_training = last_block.mlp_dropout.training
+        last_block.mlp_dropout.train()
 
-    dropout_count = enable_mc_dropout(model, p=dropout_p)
-
-    try:
-        for k in range(mc_samples):
+        try:
             if cfg_scale > 0.:
                 un_x = x.clone()
                 un_x[prompt_index] = mask_id
                 x_ = torch.cat([x, un_x], dim=0)
                 if attention_mask is not None:
                     attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
-                    logits = model(x_, attention_mask=attention_mask_).logits
+                    logits_ensemble = model.model(x_, attention_mask=attention_mask_, num_ensembles=mc_samples).logits
                 else:
-                    logits = model(x_).logits
-                logits, un_logits = torch.chunk(logits, 2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    logits_ensemble = model.model(x_, num_ensembles=mc_samples).logits
+                # logits_ensemble: [mc_samples, 2*Batch, Seq, Vocab]
+                # Split into conditioned and unconditioned
+                logits_ensemble, un_logits_ensemble = torch.chunk(logits_ensemble, 2, dim=1)
+                # Apply CFG for each ensemble member
+                logits_ensemble = un_logits_ensemble + (cfg_scale + 1) * (logits_ensemble - un_logits_ensemble)
             else:
                 if attention_mask is not None:
-                    logits = model(x, attention_mask=attention_mask).logits
+                    logits_ensemble = model.model(x, attention_mask=attention_mask, num_ensembles=mc_samples).logits
                 else:
-                    logits = model(x).logits
+                    logits_ensemble = model.model(x, num_ensembles=mc_samples).logits
+        finally:
+            # Restore original training mode to avoid side-effects
+            if not prev_training:
+                last_block.mlp_dropout.eval()
 
-            p = F.softmax(logits, dim=-1)
-            h_k = compute_entropy(p, dim=-1)
+        # logits_ensemble: [mc_samples, Batch, Seq, Vocab]
+        # Compute probs for each ensemble member
+        probs_ensemble = F.softmax(logits_ensemble, dim=-1)  # [mc_samples, Batch, Seq, Vocab]
+        entropy_ensemble = compute_entropy(probs_ensemble, dim=-1)  # [mc_samples, Batch, Seq]
+        
+        # Compute mean and uncertainties
+        p_bar = probs_ensemble.mean(dim=0)  # [Batch, Seq, Vocab]
+        mean_logits = logits_ensemble.mean(dim=0)  # [Batch, Seq, Vocab]
+        H_total = compute_entropy(p_bar, dim=-1)  # [Batch, Seq]
+        H_aleatoric = entropy_ensemble.mean(dim=0)  # [Batch, Seq]
+        H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)  # [Batch, Seq]
+        
+    else:
+        # Standard MC Dropout: Multiple forward passes
+        probs_sum = None
+        entropy_sum = None
+        logits_sum = None
 
-            if probs_sum is None:
-                probs_sum = p.clone()
-                entropy_sum = h_k.clone()
-                logits_sum = logits.clone()
-            else:
-                probs_sum = probs_sum + p
-                entropy_sum = entropy_sum + h_k
-                logits_sum = logits_sum + logits
-    except Exception as e:
-        raise e
+        dropout_count = enable_mc_dropout(model, p=dropout_p)
 
-    finally:
-        disable_mc_dropout(model)
+        try:
+            for k in range(mc_samples):
+                if cfg_scale > 0.:
+                    un_x = x.clone()
+                    un_x[prompt_index] = mask_id
+                    x_ = torch.cat([x, un_x], dim=0)
+                    if attention_mask is not None:
+                        attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
+                        logits = model(x_, attention_mask=attention_mask_).logits
+                    else:
+                        logits = model(x_).logits
+                    logits, un_logits = torch.chunk(logits, 2, dim=0)
+                    logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                else:
+                    if attention_mask is not None:
+                        logits = model(x, attention_mask=attention_mask).logits
+                    else:
+                        logits = model(x).logits
 
-    p_bar = probs_sum / mc_samples
-    mean_logits = logits_sum / mc_samples
-    H_total = compute_entropy(p_bar, dim=-1)
-    H_aleatoric = entropy_sum / mc_samples
-    H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)
+                p = F.softmax(logits, dim=-1)
+                h_k = compute_entropy(p, dim=-1)
+
+                if probs_sum is None:
+                    probs_sum = p.clone()
+                    entropy_sum = h_k.clone()
+                    logits_sum = logits.clone()
+                else:
+                    probs_sum = probs_sum + p
+                    entropy_sum = entropy_sum + h_k
+                    logits_sum = logits_sum + logits
+        except Exception as e:
+            raise e
+
+        finally:
+            disable_mc_dropout(model)
+
+        p_bar = probs_sum / mc_samples
+        mean_logits = logits_sum / mc_samples
+        H_total = compute_entropy(p_bar, dim=-1)
+        H_aleatoric = entropy_sum / mc_samples
+        H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)
 
     return mean_logits, H_epistemic, H_aleatoric, p_bar
 
