@@ -6,7 +6,7 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 1 \
+    --batch_size 4 \
     --num_samples 256 \
     --steps 256 \
     --gen_length 256 \
@@ -17,6 +17,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --logits_eos_inf \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --use_ensemble_model \
+    --memory_efficient \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty__mc16__only_last_layer__dropout_logit__eos_inf
 end_time=$(date +%s)
@@ -28,7 +29,7 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 1 \
+    --batch_size 4 \
     --num_samples 256 \
     --steps 256 \
     --gen_length 256 \
@@ -39,6 +40,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --logits_eos_inf \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --use_ensemble_model \
+    --memory_efficient \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty__mc8__only_last_layer__dropout_logit__eos_inf
 end_time=$(date +%s)
@@ -50,7 +52,7 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 1 \
+    --batch_size 4 \
     --num_samples 256 \
     --steps 256 \
     --gen_length 256 \
@@ -61,6 +63,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --logits_eos_inf \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --use_ensemble_model \
+    --memory_efficient \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty__mc4__only_last_layer__dropout_logit__eos_inf
 end_time=$(date +%s)
@@ -72,7 +75,7 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 2 \
+    --batch_size 4 \
     --num_samples 256 \
     --steps 256 \
     --gen_length 256 \
@@ -83,6 +86,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --logits_eos_inf \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --use_ensemble_model \
+    --memory_efficient \
     --output_dir ./result \
     --exp_name gsm8k_uncertainty__mc2__only_last_layer__dropout_logit__eos_inf
 end_time=$(date +%s)

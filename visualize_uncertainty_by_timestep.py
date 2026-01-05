@@ -42,7 +42,8 @@ def generate_with_uncertainty_tracking(
     alpha=1.0, 
     beta=1.0, 
     dropout_p=None,
-    use_mc_dropout_logit=False
+    use_mc_dropout_logit=False,
+    memory_efficient=False
 ):
     '''
     Generate text while tracking uncertainty at each timestep.
@@ -104,7 +105,8 @@ def generate_with_uncertainty_tracking(
                 cfg_scale=cfg_scale,
                 prompt_index=prompt_index,
                 mask_id=mask_id,
-                dropout_p=dropout_p
+                dropout_p=dropout_p,
+                memory_efficient=memory_efficient
             )
             
             # Calculate total uncertainty
@@ -506,7 +508,8 @@ def process_device_batches(args_dict):
             alpha=common_args['alpha'],
             beta=common_args['beta'],
             dropout_p=common_args['dropout_p'],
-            use_mc_dropout_logit=common_args['use_mc_dropout_logit']
+            use_mc_dropout_logit=common_args['use_mc_dropout_logit'],
+            memory_efficient=common_args['memory_efficient']
         )
 
         # Decode output for this batch
@@ -559,6 +562,8 @@ def main():
     # EnsembleLLaDA settings
     parser.add_argument('--use_ensemble_model', action='store_true',
                         help='Use EnsembleLLaDA model (replaces last layer MLP with separate dropout controlled by --dropout_p)')
+    parser.add_argument('--memory_efficient', action='store_true',
+                        help='Use memory-efficient generator mode for EnsembleLLaDA (saves memory with large num_ensembles)')
     
     # EOS token handling (from LLaDA paper Appendix B.4)
     parser.add_argument('--logits_eos_inf', action='store_true',
@@ -721,6 +726,7 @@ def main():
                 'beta': args.beta,
                 'dropout_p': args.dropout_p,
                 'use_mc_dropout_logit': args.use_mc_dropout_logit,
+                'memory_efficient': args.memory_efficient,
                 'use_ensemble_model': args.use_ensemble_model,
                 'use_prompt': args.use_prompt
             }
@@ -801,7 +807,8 @@ def main():
                     alpha=args.alpha,
                     beta=args.beta,
                     dropout_p=args.dropout_p,
-                    use_mc_dropout_logit=args.use_mc_dropout_logit
+                    use_mc_dropout_logit=args.use_mc_dropout_logit,
+                    memory_efficient=args.memory_efficient
                 )
 
                 # Decode output for this batch
@@ -919,7 +926,8 @@ def main():
             alpha=args.alpha,
             beta=args.beta,
             dropout_p=args.dropout_p,
-            use_mc_dropout_logit=args.use_mc_dropout_logit
+            use_mc_dropout_logit=args.use_mc_dropout_logit,
+            memory_efficient=args.memory_efficient
         )
         
         # Decode output

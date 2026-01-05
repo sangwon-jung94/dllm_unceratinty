@@ -87,7 +87,7 @@ def is_ensemble_model(model):
         return False
 
 
-def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_scale, prompt_index, mask_id, dropout_p=None):
+def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_scale, prompt_index, mask_id, dropout_p=None, memory_efficient=False):
     """
     Compute epistemic and aleatoric uncertainty via MC Dropout.
     
@@ -96,6 +96,8 @@ def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_
 
     Args:
         dropout_p: Dropout probability for MC Dropout. If None, uses existing layer probabilities.
+        memory_efficient: If True and using EnsembleLLaDA, uses generator mode to save memory.
+                         If False (default), uses stacked tensor mode for better compatibility.
 
     Returns:
         Tuple of (mean_logits, epistemic_uncertainty, aleatoric_uncertainty, mean_probs)
@@ -104,7 +106,6 @@ def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_
     
     if use_ensemble:
         # EnsembleLLaDA: Single forward pass with num_ensembles=mc_samples
-        # Ensure last-layer MLP dropout is active (train mode) to sample different masks
         last_block = model.model.transformer.blocks[-1]
         prev_training = last_block.mlp_dropout.training
         last_block.mlp_dropout.train()
@@ -116,35 +117,65 @@ def compute_uncertainty_decomposition(model, x, attention_mask, mc_samples, cfg_
                 x_ = torch.cat([x, un_x], dim=0)
                 if attention_mask is not None:
                     attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
-                    logits_ensemble = model.model(x_, attention_mask=attention_mask_, num_ensembles=mc_samples).logits
+                    logits_output = model.model(x_, attention_mask=attention_mask_, num_ensembles=mc_samples, memory_efficient=memory_efficient).logits
                 else:
-                    logits_ensemble = model.model(x_, num_ensembles=mc_samples).logits
-                # logits_ensemble: [mc_samples, 2*Batch, Seq, Vocab]
-                # Split into conditioned and unconditioned
-                logits_ensemble, un_logits_ensemble = torch.chunk(logits_ensemble, 2, dim=1)
-                # Apply CFG for each ensemble member
-                logits_ensemble = un_logits_ensemble + (cfg_scale + 1) * (logits_ensemble - un_logits_ensemble)
+                    logits_output = model.model(x_, num_ensembles=mc_samples, memory_efficient=memory_efficient).logits
             else:
                 if attention_mask is not None:
-                    logits_ensemble = model.model(x, attention_mask=attention_mask, num_ensembles=mc_samples).logits
+                    logits_output = model.model(x, attention_mask=attention_mask, num_ensembles=mc_samples, memory_efficient=memory_efficient).logits
                 else:
-                    logits_ensemble = model.model(x, num_ensembles=mc_samples).logits
+                    logits_output = model.model(x, num_ensembles=mc_samples, memory_efficient=memory_efficient).logits
+            
+            # Online calculation of uncertainty statistics
+            # We accumulate sum of probs and sum of entropies to compute exact MI
+            # without storing all logits in memory.
+            
+            sum_probs = None
+            sum_entropy = None
+            mean_logits = None  # We also track mean logits for final prediction if needed
+            
+            # Handle both generator (memory_efficient=True) and tensor (memory_efficient=False)
+            import types
+            if isinstance(logits_output, types.GeneratorType):
+                iterator = logits_output
+            else:
+                # Stacked tensor [num_ensembles, Batch, Seq, Vocab]
+                iterator = (logits_output[i] for i in range(logits_output.shape[0]))
+
+            for i, logits_i in enumerate(iterator):
+                # logits_i: [Batch, Seq, Vocab] or [2*Batch, Seq, Vocab] (if CFG)
+                
+                if cfg_scale > 0.:
+                    # Apply CFG per sample
+                    logits_cond, logits_uncond = torch.chunk(logits_i, 2, dim=0)
+                    logits_i = logits_uncond + (cfg_scale + 1) * (logits_cond - logits_uncond)
+                
+                probs_i = F.softmax(logits_i, dim=-1)
+                entropy_i = compute_entropy(probs_i, dim=-1)
+                
+                if i == 0:
+                    sum_probs = probs_i
+                    sum_entropy = entropy_i
+                    mean_logits = logits_i
+                else:
+                    sum_probs += probs_i
+                    sum_entropy += entropy_i
+                    # Online mean for logits (optional, but good for consistency)
+                    mean_logits += (logits_i - mean_logits) / (i + 1)
+                
+                # Explicitly delete to help GC
+                del logits_i, probs_i, entropy_i
+            
+            # Compute final statistics
+            p_bar = sum_probs / mc_samples
+            H_aleatoric = sum_entropy / mc_samples
+            H_total = compute_entropy(p_bar, dim=-1)
+            H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)
+            
         finally:
             # Restore original training mode to avoid side-effects
             if not prev_training:
                 last_block.mlp_dropout.eval()
-
-        # logits_ensemble: [mc_samples, Batch, Seq, Vocab]
-        # Compute probs for each ensemble member
-        probs_ensemble = F.softmax(logits_ensemble, dim=-1)  # [mc_samples, Batch, Seq, Vocab]
-        entropy_ensemble = compute_entropy(probs_ensemble, dim=-1)  # [mc_samples, Batch, Seq]
-        
-        # Compute mean and uncertainties
-        p_bar = probs_ensemble.mean(dim=0)  # [Batch, Seq, Vocab]
-        mean_logits = logits_ensemble.mean(dim=0)  # [Batch, Seq, Vocab]
-        H_total = compute_entropy(p_bar, dim=-1)  # [Batch, Seq]
-        H_aleatoric = entropy_ensemble.mean(dim=0)  # [Batch, Seq]
-        H_epistemic = (H_total - H_aleatoric).clamp_min(0.0)  # [Batch, Seq]
         
     else:
         # Standard MC Dropout: Multiple forward passes

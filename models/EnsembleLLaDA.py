@@ -55,6 +55,7 @@ class EnsembleLLaDABlock(LLaDALlamaBlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         num_ensembles: int = 1,
+        memory_efficient: bool = False,
     ) -> Union[Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]], 
                Tuple[List[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
         
@@ -93,14 +94,24 @@ class EnsembleLLaDABlock(LLaDALlamaBlock):
         x = self.ff_out(x) # MLP Output (Dropout 직전)
 
         # 3. Dropout Ensemble Logic
-        # num_ensembles가 1보다 크면 리스트를 반환합니다.
+        # num_ensembles > 1일 때: 이미 계산된 MLP output(x)에 대해 dropout만 여러 번 적용
+        # (Attention과 MLP forward는 위에서 한 번만 실행됨)
         if num_ensembles > 1:
-            ensemble_states = []
-            for _ in range(num_ensembles):
-                # 매번 다른 MLP Dropout 마스크가 생성됩니다.
-                dropped_x = self.mlp_dropout(x)
-                ensemble_states.append(og_x + dropped_x)
-            return ensemble_states, cache
+            if memory_efficient:
+                # Generator 방식: 메모리 효율적 (호출 시점에 하나씩 생성)
+                def ensemble_generator():
+                    for _ in range(num_ensembles):
+                        # 매번 다른 MLP Dropout 마스크가 생성됩니다.
+                        dropped_x = self.mlp_dropout(x)
+                        yield og_x + dropped_x
+                return ensemble_generator, cache, num_ensembles
+            else:
+                # 리스트 방식: 기존 호환성 유지 (모든 앙상블 결과를 메모리에 저장)
+                ensemble_states = []
+                for _ in range(num_ensembles):
+                    dropped_x = self.mlp_dropout(x)
+                    ensemble_states.append(og_x + dropped_x)
+                return ensemble_states, cache
         else:
             # 일반적인 경우 (MLP 전용 dropout 사용)
             x = self.mlp_dropout(x)
@@ -110,8 +121,11 @@ class EnsembleLLaDABlock(LLaDALlamaBlock):
 
 class EnsembleLLaDAModel(LLaDAModel):
     """
-    마지막 블록에 num_ensembles 인자를 전달하고, 
-    결과가 리스트(앙상블)일 경우 이를 처리하여 Logits들을 묶어서 반환하는 모델입니다.
+    마지막 블록에 num_ensembles 인자를 전달하고, 앙상블 결과를 처리합니다.
+    
+    Args:
+        memory_efficient: True이면 generator를 반환하여 메모리 효율적으로 처리.
+                         False(기본값)이면 [num_ensembles, Batch, Seq, Vocab] 텐서 반환.
     """
     def forward(
         self,
@@ -123,7 +137,8 @@ class EnsembleLLaDAModel(LLaDAModel):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
-        num_ensembles: int = 1, # **추가된 인자**
+        num_ensembles: int = 1,
+        memory_efficient: bool = False,  # True: generator 반환, False: 텐서 반환
     ) -> LLaDAOutput:
         
         # --- [1. Init & Embedding Processing (원본 LLaDAModel 로직 복사)] ---
@@ -188,6 +203,10 @@ class EnsembleLLaDAModel(LLaDAModel):
 
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
         all_hidden_states = []
+        
+        # 앙상블 모드를 위한 변수
+        ensemble_generator = None
+        ensemble_count = 1
 
         # --- [2. Apply Blocks (수정된 부분)] ---
         # block_group_size == 1인 경우만 우선 지원합니다 (일반적인 구조)
@@ -218,9 +237,16 @@ class EnsembleLLaDAModel(LLaDAModel):
                     # (앙상블 시 체크포인팅이 필요하다면 추가 구현 필요)
                     if current_ensembles > 1:
                         # 앙상블 블록은 직접 호출
-                         x, cache = block(
-                            x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, num_ensembles=current_ensembles
+                        result = block(
+                            x, attention_bias=attention_bias, layer_past=layer_past, 
+                            use_cache=use_cache, num_ensembles=current_ensembles,
+                            memory_efficient=memory_efficient
                         )
+                        if len(result) == 3:  # memory_efficient: generator, cache, count
+                            ensemble_generator, cache, ensemble_count = result
+                            x = None  # generator 모드에서는 x가 없음
+                        else:  # 리스트 또는 일반 텐서
+                            x, cache = result
                     else:
                         x, cache = self._activation_checkpoint_fn(
                             block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
@@ -229,9 +255,16 @@ class EnsembleLLaDAModel(LLaDAModel):
                     # 일반 호출 (여기서 num_ensembles 전달)
                     # 기존 블록일 경우 num_ensembles 인자를 받지 못해 에러가 날 수 있으므로 타입 체크
                     if isinstance(block, EnsembleLLaDABlock):
-                        x, cache = block(
-                            x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, num_ensembles=current_ensembles
+                        result = block(
+                            x, attention_bias=attention_bias, layer_past=layer_past, 
+                            use_cache=use_cache, num_ensembles=current_ensembles,
+                            memory_efficient=memory_efficient
                         )
+                        if len(result) == 3:  # memory_efficient: generator, cache, count
+                            ensemble_generator, cache, ensemble_count = result
+                            x = None  # generator 모드에서는 x가 없음
+                        else:  # 리스트 또는 일반 텐서
+                            x, cache = result
                     else:
                         x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
                 
@@ -239,9 +272,8 @@ class EnsembleLLaDAModel(LLaDAModel):
                     assert cache is not None
                     attn_key_values.append(cache)
                 
-                # 만약 결과가 리스트라면 (앙상블된 상태), 더 이상 다음 블록으로 진행할 수 없으므로 루프 종료
-                # (이미 마지막 레이어일 때만 리스트가 나오므로 논리적으로 맞습니다)
-                if isinstance(x, list):
+                # generator 모드면 루프 종료 (마지막 레이어)
+                if ensemble_generator is not None:
                     break
         else:
             # Grouped blocks (여기서는 앙상블 미지원으로 남겨둠, 필요시 구현)
@@ -268,20 +300,28 @@ class EnsembleLLaDAModel(LLaDAModel):
                 l.mul_(1 / math.sqrt(self.config.d_model))
             return l
 
-        if isinstance(x, list):
-            # 앙상블 결과 처리
-            logits_list = []
-            for state in x:
-                # 각 앙상블 상태에 대해 독립적으로 Head 통과
-                # 주의: output_hidden_states=True면 all_hidden_states 구조가 복잡해질 수 있음
-                # 여기서는 logits 계산에 집중
-                logits_list.append(compute_final_logits(state))
+        if ensemble_generator is not None:
+            # memory_efficient=True: Generator 반환
+            # 메모리 효율성을 위해 모든 logits를 미리 계산하지 않고,
+            # 필요할 때마다 하나씩 계산하여 반환하는 generator를 생성합니다.
             
-            # [Num_Ensembles, Batch, Seq, Vocab]
+            def logits_generator():
+                for state in ensemble_generator():
+                    # 각 앙상블 상태에 대해 독립적으로 Head 통과
+                    yield compute_final_logits(state)
+            
+            # LLaDAOutput의 logits 필드에 generator를 할당
+            # 호출하는 쪽(generate.py)에서 이를 인식하고 처리해야 함
+            logits = logits_generator()
+            
+        elif isinstance(x, list):
+            # memory_efficient=False: 리스트를 받아서 stacked tensor 반환
+            # [num_ensembles, Batch, Seq, Vocab]
+            logits_list = [compute_final_logits(state) for state in x]
             logits = torch.stack(logits_list, dim=0)
             
         else:
-            # 일반 처리
+            # 일반 처리 (num_ensembles=1)
             logits = compute_final_logits(x)
 
         return LLaDAOutput(
@@ -426,9 +466,34 @@ if __name__ == "__main__":
         last_block.mlp_dropout.train()
 
         input_ids = torch.randint(0, 100, (1, 10)).cuda()
-        output = model.model(input_ids, num_ensembles=5)
-        print(f"Output logits shape: {output.logits.shape}")  # 예상: [5, 1, 10, vocab_size]
         
+        # Test 1: memory_efficient=False (default) - 리스트 모드
+        print("\n[Test 1] memory_efficient=False (default)")
+        output = model.model(input_ids, num_ensembles=5, memory_efficient=False)
+        print(f"Output logits type: {type(output.logits)}")
+        assert isinstance(output.logits, torch.Tensor), "Expected tensor"
+        print(f"Output logits shape: {output.logits.shape}")
         assert output.logits.dim() == 4, f"Expected 4D tensor, got {output.logits.dim()}D"
         assert output.logits.shape[0] == 5, f"Expected 5 ensembles, got {output.logits.shape[0]}"
-        print("✓ Ensemble output shape is correct!")
+        print("✓ Stacked tensor mode works correctly!")
+        
+        # Test 2: memory_efficient=True - Generator 모드
+        print("\n[Test 2] memory_efficient=True")
+        output = model.model(input_ids, num_ensembles=5, memory_efficient=True)
+        
+        import types
+        print(f"Output logits type: {type(output.logits)}")
+        assert isinstance(output.logits, types.GeneratorType), "Expected generator"
+        print("✓ Output is a generator!")
+        
+        # Generator 소비 테스트
+        logits_list = list(output.logits)
+        print(f"Generated {len(logits_list)} logits tensors")
+        assert len(logits_list) == 5
+        print(f"First logit shape: {logits_list[0].shape}")
+        assert logits_list[0].dim() == 3  # [Batch, Seq, Vocab]
+        print("✓ Generator mode works correctly!")
+        
+        print("\n" + "=" * 50)
+        print("모든 테스트 통과!")
+        print("=" * 50)
