@@ -5,13 +5,13 @@ python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
     --num_samples 1 \
-    --batch_size 1 \
+    --batch_size 16 \
     --steps 64 \
     --gen_length 256 \
     --block_length 256 \
     --remasking uncertainty_aware \
     --logits_eos_inf \
-    --mc_samples 8 \
+    --mc_samples 6 \
     --alpha 1.0 \
     --beta 1.0 \
     --dropout_p 0.1 \

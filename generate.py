@@ -241,7 +241,7 @@ def compute_uncertainty_score(epistemic, aleatoric, alpha, beta):
 @ torch.no_grad()
 def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, block_length=128, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False, confidence_eos_eot_inf=False,
-             mc_samples=8, alpha=1.0, beta=1.0, dropout_p=None):
+             mc_samples=8, alpha=1.0, beta=1.0, dropout_p=None, topk_entropy_k_ratio=10, weighted_entropy_lambda=2.0):
     '''
     Args:
         model: Mask predictor.
@@ -251,7 +251,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
-        remasking: Remasking strategy. 'low_confidence', 'random', or 'uncertainty_aware'.
+        remasking: Remasking strategy. 'low_confidence', 'random', 'uncertainty_aware', 'topk_entropy', or 'weighted_entropy'.
         mask_id: The token id of [MASK] is 126336.
         logits_eos_inf: Whether to set the logits of EOS token to -inf. See Appendix B.4 of LLaDA for details.
         confidence_eos_eot_inf: Whether to set the confidence of EOS and EoT token to -inf. See Appendix B.4 of LLaDA for details.
@@ -263,6 +263,10 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
               Higher beta = more penalty for high aleatoric uncertainty = late-commit for ambiguous positions.
         dropout_p: Dropout probability for MC Dropout (default: None, uses existing layer probabilities).
                    Only used when remasking='uncertainty_aware'. Typical values: 0.1 to 0.3.
+        topk_entropy_k_ratio: Ratio for top-k filtering in 'topk_entropy' remasking (default: 10).
+                              k = num_transfer_tokens * topk_entropy_k_ratio.
+        weighted_entropy_lambda: Lambda for weighting top-1 entropy in 'weighted_entropy' remasking (default: 2.0).
+                                 H = lambda * H(p1, 1-p1) + (1-p1) * H(p2, p3, ...).
     '''
     # Check for dropout layers if using uncertainty-aware remasking
     if remasking == 'uncertainty_aware':
@@ -306,13 +310,19 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     mask_id=mask_id,
                     dropout_p=dropout_p
                 )
-                logits = mean_logits
-
+                # Use mean probs (p_bar) instead of mean_logits for sampling
+                # p_bar is the average of softmax outputs, which is more principled
                 if logits_eos_inf:
-                    logits[:, :, 126081] = -torch.inf
+                    p_bar[:, :, 126081] = 0.0  # Zero out EOS probability
 
-                logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1)
+                # Sample from mean probability distribution
+                if temperature == 0:
+                    x0 = torch.argmax(p_bar, dim=-1)
+                else:
+                    # Apply Gumbel noise to log probabilities
+                    log_p_bar = torch.log(p_bar + 1e-10)
+                    log_p_bar_with_noise = add_gumbel_noise(log_p_bar, temperature=temperature)
+                    x0 = torch.argmax(log_p_bar_with_noise, dim=-1)
 
                 # Compute unmasking score based on uncertainty
                 x0_p = compute_uncertainty_score(H_epistemic, H_aleatoric, alpha, beta)
@@ -346,8 +356,43 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                         torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
                 elif remasking == 'random':
                     x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-                else:
-                    raise NotImplementedError(remasking)
+                elif remasking == 'entropy':
+                    p = F.softmax(logits, dim=-1)
+                    x0_p = -compute_entropy(p, dim=-1)
+                elif remasking == 'topk_entropy':
+                    # Step 1: Get top-k positions by probability
+                    p = F.softmax(logits, dim=-1)
+                    top1_probs = torch.squeeze(
+                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                    # Calculate k based on num_transfer_tokens for this step
+                    current_transfer = num_transfer_tokens[:, i].max().item()
+                    k = max(1, int(current_transfer * topk_entropy_k_ratio))
+                    # Get top-k positions by probability (higher prob = more confident)
+                    _, topk_prob_indices = torch.topk(top1_probs, k=min(k, top1_probs.shape[-1]), dim=-1)
+                    # Step 2: Among top-k, use entropy to decide remasking order
+                    entropy = compute_entropy(p, dim=-1)
+                    # Initialize with -inf so only top-k positions are considered
+                    x0_p = torch.full_like(top1_probs, -np.inf)
+                    # Set entropy-based scores for top-k positions (negative entropy = lower uncertainty = unmask first)
+                    batch_indices = torch.arange(x0_p.shape[0], device=x0_p.device).unsqueeze(-1).expand_as(topk_prob_indices)
+                    x0_p[batch_indices, topk_prob_indices] = -entropy[batch_indices, topk_prob_indices]
+                elif remasking == 'weighted_entropy':
+                    # H = lambda * H(p1, 1-p1) + (1-p1) * H(p2, p3, ...)
+                    # where H(p1, 1-p1) = -p1*log(p1) - (1-p1)*log(1-p1) is binary entropy
+                    p = F.softmax(logits, dim=-1)
+                    # Get top-1 probability
+                    p1 = torch.squeeze(
+                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                    # Binary entropy of top-1: H(p1, 1-p1)
+                    eps = 1e-10
+                    H_binary = -p1 * torch.log(p1 + eps) - (1 - p1) * torch.log(1 - p1 + eps)
+                    # Residual entropy: H(p2, p3, ...) normalized by (1-p1)
+                    # Full entropy minus contribution from p1
+                    H_full = compute_entropy(p, dim=-1)
+                    H_residual = H_full + p1 * torch.log(p1 + eps)  # H - (-p1*log(p1)) = H + p1*log(p1)
+                    # Weighted entropy: emphasize top-1 uncertainty
+                    weighted_H = weighted_entropy_lambda * H_binary + (1 - p1) * (H_residual / (1 - p1 + eps))
+                    x0_p = -weighted_H  # Lower weighted entropy = unmask first
 
             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 

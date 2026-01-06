@@ -233,7 +233,9 @@ def generate_with_single_sample_remasking(
     beta=1.0, 
     dropout_p=None,
     use_single_sample_for_remasking=True,
-    use_single_sample_for_sampling=False
+    use_single_sample_for_sampling=False,
+    topk_entropy_k_ratio=10,
+    weighted_entropy_lambda=2.0
 ):
     '''
     실험용 생성 함수:
@@ -319,13 +321,25 @@ def generate_with_single_sample_remasking(
                 uncertainty_history['std_total'].append(total_masked.std().item())
             
             # 샘플링 로짓 선택: 앙상블(평균) vs 단일 샘플
-            logits_for_sampling = single_logits if use_single_sample_for_sampling else mean_logits_mc
-            
-            if logits_eos_inf:
-                logits_for_sampling[:, :, 126081] = -torch.inf
-
-            logits_with_noise = add_gumbel_noise(logits_for_sampling, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
+            # 앙상블의 경우 소프트맥스 평균(p_bar) 사용
+            if use_single_sample_for_sampling:
+                logits_for_sampling = single_logits
+                if logits_eos_inf:
+                    logits_for_sampling[:, :, 126081] = -torch.inf
+                logits_with_noise = add_gumbel_noise(logits_for_sampling, temperature=temperature)
+                x0 = torch.argmax(logits_with_noise, dim=-1)
+            else:
+                # 소프트맥스 평균(p_bar)으로 샘플링
+                p_bar_for_sampling = p_bar.clone()
+                if logits_eos_inf:
+                    p_bar_for_sampling[:, :, 126081] = 0.0
+                
+                if temperature == 0:
+                    x0 = torch.argmax(p_bar_for_sampling, dim=-1)
+                else:
+                    log_p_bar = torch.log(p_bar_for_sampling + 1e-10)
+                    log_p_bar_with_noise = add_gumbel_noise(log_p_bar, temperature=temperature)
+                    x0 = torch.argmax(log_p_bar_with_noise, dim=-1)
 
             # **핵심 차이점**: Remasking은 단일 샘플 또는 앙상블 선택
             if use_single_sample_for_remasking:
@@ -356,6 +370,36 @@ def generate_with_single_sample_remasking(
                 # 낮은 엔트로피(높은 확신) 먼저 언마스크되도록 음수 부호를 적용
                 entropy = compute_entropy(probs_for_remasking, dim=-1)
                 x0_p = -entropy
+            elif remasking == 'topk_entropy':
+                # Step 1: Get top-k positions by probability
+                top1_probs = torch.squeeze(
+                    torch.gather(probs_for_remasking, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                # Calculate k based on num_transfer_tokens for this step
+                current_transfer = num_transfer_tokens[:, i].max().item()
+                k = max(1, int(current_transfer * topk_entropy_k_ratio))
+                # Get top-k positions by probability (higher prob = more confident)
+                _, topk_prob_indices = torch.topk(top1_probs, k=min(k, top1_probs.shape[-1]), dim=-1)
+                # Step 2: Among top-k, use entropy to decide remasking order
+                entropy = compute_entropy(probs_for_remasking, dim=-1)
+                # Initialize with -inf so only top-k positions are considered
+                x0_p = torch.full_like(top1_probs, -np.inf)
+                # Set entropy-based scores for top-k positions
+                batch_indices = torch.arange(x0_p.shape[0], device=x0_p.device).unsqueeze(-1).expand_as(topk_prob_indices)
+                x0_p[batch_indices, topk_prob_indices] = -entropy[batch_indices, topk_prob_indices]
+            elif remasking == 'weighted_entropy':
+                # H = lambda * H(p1, 1-p1) + (1-p1) * H(p2, p3, ...)
+                # Get top-1 probability
+                p1 = torch.squeeze(
+                    torch.gather(probs_for_remasking, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                # Binary entropy of top-1: H(p1, 1-p1)
+                eps = 1e-10
+                H_binary = -p1 * torch.log(p1 + eps) - (1 - p1) * torch.log(1 - p1 + eps)
+                # Residual entropy
+                H_full = compute_entropy(probs_for_remasking, dim=-1)
+                H_residual = H_full + p1 * torch.log(p1 + eps)
+                # Weighted entropy: emphasize top-1 uncertainty
+                weighted_H = weighted_entropy_lambda * H_binary + (1 - p1) * (H_residual / (1 - p1 + eps))
+                x0_p = -weighted_H  # Lower weighted entropy = unmask first
             
             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
@@ -517,7 +561,9 @@ def process_device_batches(args_dict):
             beta=common_args['beta'],
             dropout_p=common_args['dropout_p'],
             use_single_sample_for_remasking=common_args['use_single_sample_for_remasking'],
-            use_single_sample_for_sampling=common_args['use_single_sample_for_sampling']
+            use_single_sample_for_sampling=common_args['use_single_sample_for_sampling'],
+            topk_entropy_k_ratio=common_args['topk_entropy_k_ratio'],
+            weighted_entropy_lambda=common_args['weighted_entropy_lambda']
         )
 
         batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
@@ -569,7 +615,7 @@ def main():
     
     # Uncertainty estimation parameters
     parser.add_argument('--remasking', type=str, default='low_confidence',
-                        choices=['uncertainty_aware', 'low_confidence', 'random', 'entropy'],
+                        choices=['uncertainty_aware', 'low_confidence', 'random', 'entropy', 'topk_entropy', 'weighted_entropy'],
                         help='Remasking strategy')
     parser.add_argument('--mc_samples', type=int, default=4,
                         help='Number of MC Dropout samples')
@@ -581,6 +627,10 @@ def main():
                         help='Dropout probability for MC Dropout')
     parser.add_argument('--use_mc_dropout_logit', action='store_true',
                         help='(Compatibility) Accept flag; logits already use MC dropout by design')
+    parser.add_argument('--topk_entropy_k_ratio', type=int, default=10,
+                        help='Ratio for top-k filtering in topk_entropy remasking (k = num_transfer_tokens * ratio)')
+    parser.add_argument('--weighted_entropy_lambda', type=float, default=2.0,
+                        help='Lambda for weighting top-1 entropy in weighted_entropy remasking')
 
     # EnsembleLLaDA settings
     parser.add_argument('--use_ensemble_model', action='store_true',
@@ -730,7 +780,9 @@ def main():
             'use_single_sample_for_remasking': args.use_single_sample_for_remasking,
             'use_single_sample_for_sampling': args.use_single_sample_for_sampling,
             'use_ensemble_model': args.use_ensemble_model,
-            'mask_id': 126336
+            'mask_id': 126336,
+            'topk_entropy_k_ratio': args.topk_entropy_k_ratio,
+            'weighted_entropy_lambda': args.weighted_entropy_lambda
         }
 
         executor = None
@@ -847,7 +899,9 @@ def main():
                 beta=args.beta,
                 dropout_p=args.dropout_p,
                 use_single_sample_for_remasking=args.use_single_sample_for_remasking,
-                use_single_sample_for_sampling=args.use_single_sample_for_sampling
+                use_single_sample_for_sampling=args.use_single_sample_for_sampling,
+                topk_entropy_k_ratio=args.topk_entropy_k_ratio,
+                weighted_entropy_lambda=args.weighted_entropy_lambda
             )
 
             batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)

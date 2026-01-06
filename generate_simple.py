@@ -35,10 +35,12 @@ def generate_simple(
     logits_eos_inf=False, 
     confidence_eos_eot_inf=False,
     dropout_p=None,
+    topk_entropy_k_ratio=10,
+    weighted_entropy_lambda=2.0,
 ):
     '''
     Generate text without uncertainty tracking.
-    Only supports 'low_confidence' and 'random' remasking.
+    Supports 'low_confidence', 'random', 'entropy', 'topk_entropy', and 'weighted_entropy' remasking.
     
     Returns:
         x: Generated sequences
@@ -112,8 +114,42 @@ def generate_simple(
                 entropy = -torch.sum(p * log_p, dim=-1)
                 # Negate entropy so lower entropy (more confident) gets higher priority
                 x0_p = -entropy
+            elif remasking == 'topk_entropy':
+                # Step 1: Get top-k positions by probability
+                p = F.softmax(logits, dim=-1)
+                top1_probs = torch.squeeze(
+                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                # Calculate k based on num_transfer_tokens for this step
+                current_transfer = num_transfer_tokens[:, i].max().item()
+                k = max(1, int(current_transfer * topk_entropy_k_ratio))
+                # Get top-k positions by probability (higher prob = more confident)
+                _, topk_prob_indices = torch.topk(top1_probs, k=min(k, top1_probs.shape[-1]), dim=-1)
+                # Step 2: Among top-k, use entropy to decide remasking order
+                log_p = torch.log(p + 1e-10)
+                entropy = -torch.sum(p * log_p, dim=-1)
+                # Initialize with -inf so only top-k positions are considered
+                x0_p = torch.full_like(top1_probs, -np.inf)
+                # Set entropy-based scores for top-k positions (negative entropy = lower uncertainty = unmask first)
+                batch_indices = torch.arange(x0_p.shape[0], device=x0_p.device).unsqueeze(-1).expand_as(topk_prob_indices)
+                x0_p[batch_indices, topk_prob_indices] = -entropy[batch_indices, topk_prob_indices]
+            elif remasking == 'weighted_entropy':
+                # H = lambda * H(p1, 1-p1) + (1-p1) * H(p2, p3, ...)
+                p = F.softmax(logits, dim=-1)
+                # Get top-1 probability
+                p1 = torch.squeeze(
+                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                # Binary entropy of top-1: H(p1, 1-p1)
+                eps = 1e-10
+                H_binary = -p1 * torch.log(p1 + eps) - (1 - p1) * torch.log(1 - p1 + eps)
+                # Residual entropy
+                log_p = torch.log(p + eps)
+                H_full = -torch.sum(p * log_p, dim=-1)
+                H_residual = H_full + p1 * torch.log(p1 + eps)
+                # Weighted entropy: emphasize top-1 uncertainty
+                weighted_H = weighted_entropy_lambda * H_binary + (1 - p1) * (H_residual / (1 - p1 + eps))
+                x0_p = -weighted_H  # Lower weighted entropy = unmask first
             else:
-                raise ValueError(f"Unsupported remasking strategy: {remasking}. Use 'low_confidence', 'random', or 'entropy'.")
+                raise ValueError(f"Unsupported remasking strategy: {remasking}. Use 'low_confidence', 'random', 'entropy', 'topk_entropy', or 'weighted_entropy'.")
             
             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
@@ -251,6 +287,8 @@ def process_device_batches(args_dict):
             logits_eos_inf=common_args['logits_eos_inf'],
             confidence_eos_eot_inf=common_args['confidence_eos_eot_inf'],
             dropout_p=common_args['dropout_p'],
+            topk_entropy_k_ratio=common_args['topk_entropy_k_ratio'],
+            weighted_entropy_lambda=common_args['weighted_entropy_lambda'],
         )
 
         batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
@@ -286,8 +324,12 @@ def main():
     
     # Remasking strategy (only low_confidence and random)
     parser.add_argument('--remasking', type=str, default='low_confidence',
-                        choices=['low_confidence', 'random', 'entropy'],
-                        help='Remasking strategy (uncertainty_aware not supported)')
+                        choices=['low_confidence', 'random', 'entropy', 'topk_entropy', 'weighted_entropy'],
+                        help='Remasking strategy')
+    parser.add_argument('--topk_entropy_k_ratio', type=int, default=10,
+                        help='Ratio for top-k filtering in topk_entropy remasking (k = num_transfer_tokens * ratio)')
+    parser.add_argument('--weighted_entropy_lambda', type=float, default=2.0,
+                        help='Lambda for weighting top-1 entropy in weighted_entropy remasking')
 
     parser.add_argument('--dropout_p', type=float, default=None,
                         help='Dropout probability to set (used for MC dropout and EnsembleLLaDA MLP; None uses model default)')
@@ -435,7 +477,9 @@ def main():
                 'logits_eos_inf': args.logits_eos_inf,
                 'confidence_eos_eot_inf': args.confidence_eos_eot_inf,
                 'dropout_p': args.dropout_p,
-                'use_ensemble_model': args.use_ensemble_model
+                'use_ensemble_model': args.use_ensemble_model,
+                'topk_entropy_k_ratio': args.topk_entropy_k_ratio,
+                'weighted_entropy_lambda': args.weighted_entropy_lambda
             }
 
             try:
@@ -505,6 +549,8 @@ def main():
                     logits_eos_inf=args.logits_eos_inf,
                     confidence_eos_eot_inf=args.confidence_eos_eot_inf,
                     dropout_p=args.dropout_p,
+                    topk_entropy_k_ratio=args.topk_entropy_k_ratio,
+                    weighted_entropy_lambda=args.weighted_entropy_lambda,
                 )
 
                 # Decode output for this batch
@@ -585,6 +631,8 @@ def main():
             logits_eos_inf=args.logits_eos_inf,
             confidence_eos_eot_inf=args.confidence_eos_eot_inf,
             dropout_p=args.dropout_p,
+            topk_entropy_k_ratio=args.topk_entropy_k_ratio,
+            weighted_entropy_lambda=args.weighted_entropy_lambda,
         )
         
         # Decode output
