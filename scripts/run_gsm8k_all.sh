@@ -7,7 +7,7 @@ python generate_simple.py \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
-    --batch_size 8 \
+    --batch_size 16 \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --logits_eos_inf \
     --use_ensemble_model \
@@ -28,7 +28,7 @@ python generate_simple.py \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
-    --batch_size 8 \
+    --batch_size 16 \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --logits_eos_inf \
     --use_ensemble_model \
@@ -44,7 +44,7 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 4 \
+    --batch_size 16 \
     --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
@@ -71,7 +71,7 @@ python generate_simple.py \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
-    --batch_size 8 \
+    --batch_size 16 \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --logits_eos_inf \
     --use_ensemble_model \
@@ -92,7 +92,7 @@ python generate_simple.py \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
-    --batch_size 8 \
+    --batch_size 16 \
     --device cuda:0 cuda:1 cuda:2 cuda:3 \
     --logits_eos_inf \
     --use_ensemble_model \
@@ -108,7 +108,7 @@ start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 4 \
+    --batch_size 16 \
     --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
