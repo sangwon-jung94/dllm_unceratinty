@@ -1,50 +1,50 @@
-start_time=$(date +%s)
-python generate_simple.py \
-    --use_prompt \
-    --benchmark gsm8k \
-    --num_samples 20000 \
-    --remasking topk_entropy \
-    --steps 256 \
-    --gen_length 256 \
-    --block_length 256 \
-    --batch_size 8 \
-    --device cuda:2 cuda:3 \
-    --logits_eos_inf \
-    --use_ensemble_model \
-    --output_dir ./result \
-    --exp_name only_last_layer/gsm8k_dropout0.1_only_last_layer_topk_entropy_all \
-    --dropout_p 0.1
-end_time=$(date +%s)
-elapsed=$((end_time - start_time))
-echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
+# start_time=$(date +%s)
+# python generate_simple.py \
+#     --use_prompt \
+#     --benchmark gsm8k \
+#     --num_samples 20000 \
+#     --remasking topk_entropy \
+#     --steps 256 \
+#     --gen_length 256 \
+#     --block_length 256 \
+#     --batch_size 16 \
+#     --device cuda:2 cuda:3 \
+#     --logits_eos_inf \
+#     --use_ensemble_model \
+#     --output_dir ./result \
+#     --exp_name only_last_layer/gsm8k_dropout0.1_only_last_layer_topk_entropy_all \
+#     --dropout_p 0.1
+# end_time=$(date +%s)
+# elapsed=$((end_time - start_time))
+# echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
 
-start_time=$(date +%s)
-python generate_simple.py \
-    --use_prompt \
-    --benchmark gsm8k \
-    --num_samples 20000 \
-    --remasking topk_entropy \
-    --steps 256 \
-    --gen_length 256 \
-    --block_length 256 \
-    --batch_size 8 \
-    --device cuda:2 cuda:3 \
-    --logits_eos_inf \
-    --use_ensemble_model \
-    --output_dir ./result \
-    --exp_name only_last_layer/gsm8k_only_last_layer_topk_entropy_all \
-    --dropout_p 0.1
-end_time=$(date +%s)
-elapsed=$((end_time - start_time))
-echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
+# start_time=$(date +%s)
+# python generate_simple.py \
+#     --use_prompt \
+#     --benchmark gsm8k \
+#     --num_samples 20000 \
+#     --remasking topk_entropy \
+#     --steps 256 \
+#     --gen_length 256 \
+#     --block_length 256 \
+#     --batch_size 16 \
+#     --device cuda:2 cuda:3 \
+#     --logits_eos_inf \
+#     --use_ensemble_model \
+#     --output_dir ./result \
+#     --exp_name only_last_layer/gsm8k_only_last_layer_topk_entropy_all \
+#     --dropout_p 0.1
+# end_time=$(date +%s)
+# elapsed=$((end_time - start_time))
+# echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
 
 start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 4 \
+    --batch_size 16 \
     --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
@@ -71,7 +71,7 @@ python generate_simple.py \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
-    --batch_size 8 \
+    --batch_size 16 \
     --device cuda:2 cuda:3 \
     --logits_eos_inf \
     --use_ensemble_model \
@@ -92,7 +92,7 @@ python generate_simple.py \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
-    --batch_size 8 \
+    --batch_size 16 \
     --device cuda:2 cuda:3 \
     --logits_eos_inf \
     --use_ensemble_model \
@@ -228,7 +228,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
     --batch_size 16 \
-    --num_samples 256 \
+    --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
@@ -250,7 +250,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
     --batch_size 16 \
-    --num_samples 256 \
+    --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
@@ -272,7 +272,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
     --batch_size 16 \
-    --num_samples 256 \
+    --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
@@ -294,7 +294,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
     --batch_size 16 \
-    --num_samples 256 \
+    --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \
@@ -316,7 +316,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
     --batch_size 16 \
-    --num_samples 256 \
+    --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
     --block_length 256 \

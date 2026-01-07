@@ -864,49 +864,51 @@ def main():
         if tokenizer.padding_side != 'left':
             tokenizer.padding_side = 'left'
 
-        for batch_idx in tqdm(range(0, len(all_prompts), batch_size), desc="Processing batches", total=num_batches, position=0, leave=True):
-            batch_prompts = all_prompts[batch_idx:batch_idx + batch_size]
+        with tqdm(total=num_batches, desc="Processing batches", position=0, leave=True) as batch_pbar:
+            for batch_idx in range(0, len(all_prompts), batch_size):
+                batch_prompts = all_prompts[batch_idx:batch_idx + batch_size]
 
-            messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
-            formatted_prompts = [
-                tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
-                for message in messages
-            ]
+                messages = [{"role": "user", "content": prompt} for prompt in batch_prompts]
+                formatted_prompts = [
+                    tokenizer.apply_chat_template([message], add_generation_prompt=True, tokenize=False) 
+                    for message in messages
+                ]
 
-            encoded_outputs = tokenizer(
-                formatted_prompts,
-                add_special_tokens=False,
-                padding=True,
-                return_tensors="pt"
-            )
-            input_ids = encoded_outputs['input_ids'].to(device)
-            attention_mask = encoded_outputs['attention_mask'].to(device)
+                encoded_outputs = tokenizer(
+                    formatted_prompts,
+                    add_special_tokens=False,
+                    padding=True,
+                    return_tensors="pt"
+                )
+                input_ids = encoded_outputs['input_ids'].to(device)
+                attention_mask = encoded_outputs['attention_mask'].to(device)
 
-            out, uncertainty_history = generate_with_single_sample_remasking(
-                model=model,
-                prompt=input_ids,
-                attention_mask=attention_mask,
-                steps=args.steps,
-                gen_length=args.gen_length,
-                block_length=args.block_length,
-                temperature=args.temperature,
-                cfg_scale=args.cfg_scale,
-                remasking=args.remasking,
-                logits_eos_inf=args.logits_eos_inf,
-                confidence_eos_eot_inf=args.confidence_eos_eot_inf,
-                mc_samples=args.mc_samples,
-                alpha=args.alpha,
-                beta=args.beta,
-                dropout_p=args.dropout_p,
-                use_single_sample_for_remasking=args.use_single_sample_for_remasking,
-                use_single_sample_for_sampling=args.use_single_sample_for_sampling,
-                topk_entropy_k_ratio=args.topk_entropy_k_ratio,
-                weighted_entropy_lambda=args.weighted_entropy_lambda
-            )
+                out, uncertainty_history = generate_with_single_sample_remasking(
+                    model=model,
+                    prompt=input_ids,
+                    attention_mask=attention_mask,
+                    steps=args.steps,
+                    gen_length=args.gen_length,
+                    block_length=args.block_length,
+                    temperature=args.temperature,
+                    cfg_scale=args.cfg_scale,
+                    remasking=args.remasking,
+                    logits_eos_inf=args.logits_eos_inf,
+                    confidence_eos_eot_inf=args.confidence_eos_eot_inf,
+                    mc_samples=args.mc_samples,
+                    alpha=args.alpha,
+                    beta=args.beta,
+                    dropout_p=args.dropout_p,
+                    use_single_sample_for_remasking=args.use_single_sample_for_remasking,
+                    use_single_sample_for_sampling=args.use_single_sample_for_sampling,
+                    topk_entropy_k_ratio=args.topk_entropy_k_ratio,
+                    weighted_entropy_lambda=args.weighted_entropy_lambda
+                )
 
-            batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-            all_outputs.extend(batch_output)
-            all_uncertainty_histories.append(uncertainty_history)
+                batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+                all_outputs.extend(batch_output)
+                all_uncertainty_histories.append(uncertainty_history)
+                batch_pbar.update(1)
 
     # Aggregate histories across batches/devices
     history_keys = ['mean_epistemic', 'mean_aleatoric', 'mean_total', 
