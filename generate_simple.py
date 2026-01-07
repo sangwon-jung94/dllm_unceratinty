@@ -116,23 +116,35 @@ def generate_simple(
                 # Negate entropy so lower entropy (more confident) gets higher priority
                 x0_p = -entropy
             elif remasking == 'topk_entropy':
-                # Step 1: Get top-k positions by probability
+                # Step 1: Get top-k positions by probability, but restrict to masked tokens in the current block
                 p = F.softmax(logits, dim=-1)
                 top1_probs = torch.squeeze(
                     torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                current_block_start = prompt.shape[1] + num_block * block_length
+                current_block_end = prompt.shape[1] + (num_block + 1) * block_length
+                candidate_mask = mask_index.clone()
+                candidate_mask[:, :current_block_start] = False
+                candidate_mask[:, current_block_end:] = False
+                masked_top1_probs = top1_probs.masked_fill(~candidate_mask, -torch.inf)
                 # Calculate k based on num_transfer_tokens for this step
                 current_transfer = num_transfer_tokens[:, i].max().item()
                 k = max(1, int(current_transfer * topk_entropy_k_ratio))
-                # Get top-k positions by probability (higher prob = more confident)
-                _, topk_prob_indices = torch.topk(top1_probs, k=min(k, top1_probs.shape[-1]), dim=-1)
-                # Step 2: Among top-k, use entropy to decide remasking order
-                log_p = torch.log(p + 1e-10)
-                entropy = -torch.sum(p * log_p, dim=-1)
-                # Initialize with -inf so only top-k positions are considered
-                x0_p = torch.full_like(top1_probs, -np.inf)
-                # Set entropy-based scores for top-k positions (negative entropy = lower uncertainty = unmask first)
-                batch_indices = torch.arange(x0_p.shape[0], device=x0_p.device).unsqueeze(-1).expand_as(topk_prob_indices)
-                x0_p[batch_indices, topk_prob_indices] = -entropy[batch_indices, topk_prob_indices]
+                available = candidate_mask.sum(dim=1).max().item()
+
+                if available == 0:
+                    x0_p = torch.full_like(top1_probs, -np.inf)
+                else:
+                    k = min(k, available)
+                    # Get top-k positions by probability (higher prob = more confident)
+                    _, topk_prob_indices = torch.topk(masked_top1_probs, k=min(k, masked_top1_probs.shape[-1]), dim=-1)
+                    # Step 2: Among top-k, use entropy to decide remasking order
+                    log_p = torch.log(p + 1e-10)
+                    entropy = -torch.sum(p * log_p, dim=-1)
+                    # Initialize with -inf so only top-k positions are considered
+                    x0_p = torch.full_like(top1_probs, -np.inf)
+                    # Set entropy-based scores for top-k positions (negative entropy = lower uncertainty = unmask first)
+                    batch_indices = torch.arange(x0_p.shape[0], device=x0_p.device).unsqueeze(-1).expand_as(topk_prob_indices)
+                    x0_p[batch_indices, topk_prob_indices] = -entropy[batch_indices, topk_prob_indices]
             elif remasking == 'weighted_entropy':
                 # H = lambda * H(p1, 1-p1) + (1-p1) * H(p2, p3, ...)
                 p = F.softmax(logits, dim=-1)
