@@ -95,7 +95,15 @@ def generate_with_uncertainty_tracking(
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
-        for i in tqdm(range(steps_per_block), desc=f"Block {num_block+1}/{num_blocks} steps", leave=False):
+        # NOTE: When called under an outer tqdm (e.g., batch progress), we need
+        # a different `position` so both bars remain visible.
+        for i in tqdm(
+            range(steps_per_block),
+            desc=f"Block {num_block+1}/{num_blocks} steps",
+            leave=False,
+            position=1,
+            dynamic_ncols=True,
+        ):
             mask_index = (x == mask_id)
             
             # Compute uncertainty decomposition with MC Dropout (for uncertainty estimation only)
@@ -132,11 +140,24 @@ def generate_with_uncertainty_tracking(
                 uncertainty_history['std_aleatoric'].append(aleatoric_masked.std(unbiased=False).item())
                 uncertainty_history['std_total'].append(total_masked.std(unbiased=False).item())
             
-            # Get logits for actual token sampling
-            # Use MC dropout logits or clean logits based on use_mc_dropout_logit option
+            # Get logits/probs for actual token sampling
+            # Use MC dropout mean probability or clean logits based on use_mc_dropout_logit option
             if use_mc_dropout_logit:
-                # Use MC dropout averaged logits (already computed above)
-                logits = mean_logits_mc
+                # Use MC dropout averaged probability (p_bar) for sampling
+                # Note: We use p_bar (mean of softmax) instead of softmax(mean_logits)
+                # because E[softmax(logits)] != softmax(E[logits])
+                p_for_sampling = p_bar.clone()
+                if logits_eos_inf:
+                    p_for_sampling[:, :, 126081] = 0.0
+                
+                if temperature == 0:
+                    x0 = torch.argmax(p_for_sampling, dim=-1)
+                else:
+                    log_p = torch.log(p_for_sampling + 1e-10)
+                    log_p_with_noise = add_gumbel_noise(log_p, temperature=temperature)
+                    x0 = torch.argmax(log_p_with_noise, dim=-1)
+                logits = None  # Not used when use_mc_dropout_logit=True
+                p = p_for_sampling
             else:
                 # Use clean logits without dropout for high-quality generation
                 if cfg_scale > 0:
@@ -154,49 +175,37 @@ def generate_with_uncertainty_tracking(
                         input_ids=x,
                         attention_mask=attention_mask
                     ).logits
-            
-            if logits_eos_inf:
-                logits[:, :, 126081] = -torch.inf
+                
+                if logits_eos_inf:
+                    logits[:, :, 126081] = -torch.inf
+                
+                logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+                x0 = torch.argmax(logits_with_noise, dim=-1)
+                p = F.softmax(logits, dim=-1)
 
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
-
-            # Apply confidence_eos_eot_inf before computing remasking scores
+            # Apply confidence_eos_eot_inf to probability for remasking
             # This ensures EOS/EoT tokens are unmasked last
             if confidence_eos_eot_inf:
-                logits[:, :, 126081] = logits[:, :, 126348] = -torch.inf
+                p[:, :, 126081] = 0.0
+                p[:, :, 126348] = 0.0
 
             # Choose remasking strategy
             if remasking == 'uncertainty_aware':
-                # Use mean probs (p_bar) for sampling instead of mean_logits
-                p_bar_for_sampling = p_bar.clone()
-                if logits_eos_inf:
-                    p_bar_for_sampling[:, :, 126081] = 0.0
-                
-                if temperature == 0:
-                    x0 = torch.argmax(p_bar_for_sampling, dim=-1)
-                else:
-                    log_p_bar = torch.log(p_bar_for_sampling + 1e-10)
-                    log_p_bar_with_noise = add_gumbel_noise(log_p_bar, temperature=temperature)
-                    x0 = torch.argmax(log_p_bar_with_noise, dim=-1)
-                
-                # Compute unmasking score based on uncertainty
+                # For uncertainty_aware, we already sampled x0 above
+                # Just compute unmasking score based on uncertainty
                 x0_p = compute_uncertainty_score(H_epistemic, H_aleatoric, alpha, beta)
             elif remasking == 'low_confidence':
                 # Use confidence (probability of predicted token)
-                p = F.softmax(logits, dim=-1)
                 x0_p = torch.squeeze(
                     torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
             elif remasking == 'random':
                 # Random selection
                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
             elif remasking == 'entropy':
-                p = F.softmax(logits, dim=-1)
                 entropy = compute_entropy(p, dim=-1)
                 x0_p = -entropy
             elif remasking == 'topk_entropy':
                 # Step 1: Get top-k positions by probability
-                p = F.softmax(logits, dim=-1)
                 top1_probs = torch.squeeze(
                     torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
                 # Calculate k based on num_transfer_tokens for this step
@@ -213,7 +222,6 @@ def generate_with_uncertainty_tracking(
                 x0_p[batch_indices, topk_prob_indices] = -entropy[batch_indices, topk_prob_indices]
             elif remasking == 'weighted_entropy':
                 # H = lambda * H(p1, 1-p1) + (1-p1) * H(p2, p3, ...)
-                p = F.softmax(logits, dim=-1)
                 # Get top-1 probability
                 p1 = torch.squeeze(
                     torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
@@ -829,7 +837,7 @@ def main():
         
         else:
             # Sequential processing on single device (original code)
-            with tqdm(total=num_batches, desc="Batch", position=0, leave=True) as batch_pbar:
+            with tqdm(total=num_batches, desc="Batch", position=0, leave=True, dynamic_ncols=True) as batch_pbar:
                 for batch_idx in range(0, len(all_prompts), args.batch_size):
                     batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
 

@@ -12,7 +12,7 @@ fi
 echo "================================"
 
 # result 디렉토리의 모든 gsm8k 관련 폴더 찾기
-for result_dir in ./result/gsm8k_*/; do
+for result_dir in ./result/only_last_layer/gsm8k_*/; do
     if [ -f "${result_dir}output.txt" ]; then
         exp_name=$(basename "$result_dir")
         echo ""
@@ -42,7 +42,7 @@ echo ""
 echo "Summary:"
 echo "--------"
 # 모든 결과의 accuracy를 한번에 보기
-for result_dir in ./result/gsm8k_*/; do
+for result_dir in ./result/only_last_layer/gsm8k_*/; do
     if [ -f "${result_dir}evaluation.json" ]; then
         exp_name=$(basename "$result_dir")
         accuracy=$(python3 -c "import json; f=open('${result_dir}evaluation.json'); d=json.load(f); print(f\"{d['accuracy']:.2f}%\")")

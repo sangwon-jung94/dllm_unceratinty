@@ -1,50 +1,50 @@
-start_time=$(date +%s)
-python generate_simple.py \
-    --use_prompt \
-    --benchmark gsm8k \
-    --num_samples 20000 \
-    --remasking topk_entropy \
-    --steps 256 \
-    --gen_length 256 \
-    --block_length 256 \
-    --batch_size 4 \
-    --device cuda:0 \
-    --logits_eos_inf \
-    --use_ensemble_model \
-    --output_dir ./result \
-    --exp_name only_last_layer/gsm8k_dropout0.1_only_last_layer_topk_entropy_all \
-    --dropout_p 0.1
-end_time=$(date +%s)
-elapsed=$((end_time - start_time))
-echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
+# start_time=$(date +%s)
+# python generate_simple.py \
+#     --use_prompt \
+#     --benchmark gsm8k \
+#     --num_samples 20000 \
+#     --remasking topk_entropy \
+#     --steps 256 \
+#     --gen_length 256 \
+#     --block_length 256 \
+#     --batch_size 32 \
+#     --device cuda:2 cuda:3 cuda:7 \
+#     --logits_eos_inf \
+#     --use_ensemble_model \
+#     --output_dir ./result \
+#     --exp_name only_last_layer/gsm8k_dropout0.1_only_last_layer_topk_entropy_all \
+#     --dropout_p 0.1
+# end_time=$(date +%s)
+# elapsed=$((end_time - start_time))
+# echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
 
-start_time=$(date +%s)
-python generate_simple.py \
-    --use_prompt \
-    --benchmark gsm8k \
-    --num_samples 20000 \
-    --remasking topk_entropy \
-    --steps 256 \
-    --gen_length 256 \
-    --block_length 256 \
-    --batch_size 4 \
-    --device cuda:0 \
-    --logits_eos_inf \
-    --use_ensemble_model \
-    --output_dir ./result \
-    --exp_name only_last_layer/gsm8k_only_last_layer_topk_entropy_all \
-    --dropout_p 0.1
-end_time=$(date +%s)
-elapsed=$((end_time - start_time))
-echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
+# start_time=$(date +%s)
+# python generate_simple.py \
+#     --use_prompt \
+#     --benchmark gsm8k \
+#     --num_samples 20000 \
+#     --remasking topk_entropy \
+#     --steps 256 \
+#     --gen_length 256 \
+#     --block_length 256 \
+#     --batch_size 32 \
+#     --device cuda:2 cuda:3 cuda:7 \
+#     --logits_eos_inf \
+#     --use_ensemble_model \
+#     --output_dir ./result \
+#     --exp_name only_last_layer/gsm8k_only_last_layer_topk_entropy_all \
+#     --dropout_p 0.1
+# end_time=$(date +%s)
+# elapsed=$((end_time - start_time))
+# echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
 
 start_time=$(date +%s)
 python3 visualize_uncertainty_by_timestep.py \
     --use_prompt \
     --benchmark gsm8k \
-    --batch_size 4 \
+    --batch_size 32 \
     --num_samples 20000 \
     --steps 256 \
     --gen_length 256 \
@@ -53,7 +53,7 @@ python3 visualize_uncertainty_by_timestep.py \
     --mc_samples 6  --dropout_p 0.1 \
     --use_mc_dropout_logit \
     --logits_eos_inf \
-    --device cuda:0 \
+    --device cuda:2 cuda:3 cuda:7 \
     --use_ensemble_model \
     --memory_efficient \
     --output_dir ./result \
@@ -104,29 +104,30 @@ echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 # echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
 
-# start_time=$(date +%s)
-# python3 visualize_uncertainty_by_timestep.py \
-#     --use_prompt \
-#     --benchmark gsm8k \
-#     --batch_size 4 \
-#     --num_samples 20000 \
-#     --steps 256 \
-#     --gen_length 256 \
-#     --block_length 256 \
-#     --remasking weighted_entropy \
-#     --mc_samples 6  --dropout_p 0.1 \
-#     --use_mc_dropout_logit \
-#     --logits_eos_inf \
-#     --device cuda:2 cuda:3 \
-#     --use_ensemble_model \
-#     --memory_efficient \
-#     --output_dir ./result \
-#     --exp_name only_last_layer/gsm8k_weighted_entropy__mc6__only_last_layer__dropout_logit__eos_inf
-# end_time=$(date +%s)
-# elapsed=$((end_time - start_time))
-# echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
+start_time=$(date +%s)
+python3 visualize_uncertainty_by_timestep.py \
+    --use_prompt \
+    --benchmark gsm8k \
+    --batch_size 32 \
+    --num_samples 20000 \
+    --steps 256 \
+    --gen_length 256 \
+    --block_length 256 \
+    --remasking weighted_entropy \
+    --mc_samples 6  --dropout_p 0.1 \
+    --use_mc_dropout_logit \
+    --logits_eos_inf \
+    --device cuda:2 cuda:3 cuda:7 \
+    --use_ensemble_model \
+    --memory_efficient \
+    --output_dir ./result \
+    --exp_name only_last_layer/gsm8k_weighted_entropy__mc6__only_last_layer__dropout_logit__eos_inf
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
 # # =============================================================================
+#single sample / single remasking 실험
 
 # start_time=$(date +%s)
 # python3 visualize_uncertainty_single_sample_remasking.py \
@@ -223,49 +224,49 @@ echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 # #=============================================================================
 # # 표준 실험
 
-# start_time=$(date +%s)
-# python3 visualize_uncertainty_by_timestep.py \
-#     --use_prompt \
-#     --benchmark gsm8k \
-#     --batch_size 16 \
-#     --num_samples 20000 \
-#     --steps 256 \
-#     --gen_length 256 \
-#     --block_length 256 \
-#     --remasking entropy \
-#     --mc_samples 6  --alpha 1.0 --beta 0.0  --dropout_p 0.1 \
-#     --use_mc_dropout_logit \
-#     --logits_eos_inf \
-#     --device cuda:2 cuda:3 \
-#     --use_ensemble_model \
-#     --memory_efficient \
-#     --output_dir ./result \
-#     --exp_name only_last_layer/gsm8k_entropy__mc6__only_last_layer__dropout_logit__eos_inf
-# end_time=$(date +%s)
-# elapsed=$((end_time - start_time))
-# echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
+start_time=$(date +%s)
+python3 visualize_uncertainty_by_timestep.py \
+    --use_prompt \
+    --benchmark gsm8k \
+    --batch_size 16 \
+    --num_samples 20000 \
+    --steps 256 \
+    --gen_length 256 \
+    --block_length 256 \
+    --remasking entropy \
+    --mc_samples 6  --alpha 1.0 --beta 0.0  --dropout_p 0.1 \
+    --use_mc_dropout_logit \
+    --logits_eos_inf \
+    --device cuda:2 cuda:3 cuda:7 \
+    --use_ensemble_model \
+    --memory_efficient \
+    --output_dir ./result \
+    --exp_name only_last_layer/gsm8k_entropy__mc6__only_last_layer__dropout_logit__eos_inf
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
-# start_time=$(date +%s)
-# python3 visualize_uncertainty_by_timestep.py \
-#     --use_prompt \
-#     --benchmark gsm8k \
-#     --batch_size 16 \
-#     --num_samples 20000 \
-#     --steps 256 \
-#     --gen_length 256 \
-#     --block_length 256 \
-#     --remasking low_confidence \
-#     --mc_samples 6  --alpha 1.0 --beta 0.0  --dropout_p 0.1 \
-#     --use_mc_dropout_logit \
-#     --logits_eos_inf \
-#     --device cuda:2 cuda:3 \
-#     --use_ensemble_model \
-#     --memory_efficient \
-#     --output_dir ./result \
-#     --exp_name only_last_layer/gsm8k_low_confidence__mc6__only_last_layer__dropout_logit__eos_inf
-# end_time=$(date +%s)
-# elapsed=$((end_time - start_time))
-# echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
+start_time=$(date +%s)
+python3 visualize_uncertainty_by_timestep.py \
+    --use_prompt \
+    --benchmark gsm8k \
+    --batch_size 16 \
+    --num_samples 20000 \
+    --steps 256 \
+    --gen_length 256 \
+    --block_length 256 \
+    --remasking low_confidence \
+    --mc_samples 6  --alpha 1.0 --beta 0.0  --dropout_p 0.1 \
+    --use_mc_dropout_logit \
+    --logits_eos_inf \
+    --device cuda:2 cuda:3 cuda:7 \
+    --use_ensemble_model \
+    --memory_efficient \
+    --output_dir ./result \
+    --exp_name only_last_layer/gsm8k_low_confidence__mc6__only_last_layer__dropout_logit__eos_inf
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 
 # start_time=$(date +%s)
 # python3 visualize_uncertainty_by_timestep.py \

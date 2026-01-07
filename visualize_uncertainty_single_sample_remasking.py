@@ -343,17 +343,17 @@ def generate_with_single_sample_remasking(
 
             # **핵심 차이점**: Remasking은 단일 샘플 또는 앙상블 선택
             if use_single_sample_for_remasking:
-                # 단일 샘플 로짓으로 remasking 결정
-                logits_for_remasking = single_logits
-                probs_for_remasking = single_probs
+                # 단일 샘플 확률로 remasking 결정
+                probs_for_remasking = single_probs.clone()
             else:
-                # 앙상블 로짓으로 remasking 결정 (기존 방식)
-                logits_for_remasking = mean_logits_mc
-                probs_for_remasking = p_bar
+                # 앙상블 평균 확률로 remasking 결정
+                probs_for_remasking = p_bar.clone()
 
-            # Apply confidence_eos_eot_inf before computing remasking scores
+            # Apply confidence_eos_eot_inf to probability for remasking
+            # This ensures EOS/EoT tokens are unmasked last
             if confidence_eos_eot_inf:
-                logits_for_remasking[:, :, 126081] = logits_for_remasking[:, :, 126348] = -torch.inf
+                probs_for_remasking[:, :, 126081] = 0.0
+                probs_for_remasking[:, :, 126348] = 0.0
 
             # Choose remasking strategy
             if remasking == 'uncertainty_aware':
