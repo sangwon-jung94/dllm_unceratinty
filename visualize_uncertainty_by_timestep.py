@@ -18,7 +18,6 @@ import signal
 import sys
 from datetime import datetime
 from datasets import load_dataset
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
 from tqdm import tqdm
@@ -478,15 +477,12 @@ def worker_init():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
-def process_device_batches(args_dict):
-    '''Run all assigned batches sequentially on one device to avoid overlapping loads.'''
-    device = args_dict['device']
-    device_batches = args_dict['device_batches']  # list of (batch_idx, batch_prompts)
-    common_args = args_dict['common_args']
-    
+def gpu_worker(device, task_queue, result_queue, common_args):
+    '''Worker process that loads model once and processes batches from queue dynamically.'''
     if device != 'cpu':
         torch.cuda.set_device(device)
     
+    # Load model ONCE at worker startup
     if common_args.get('use_ensemble_model', False):
         model = get_ensemble_model(
             common_args['model_path'],
@@ -508,9 +504,17 @@ def process_device_batches(args_dict):
     if tokenizer.padding_side != 'left':
         tokenizer.padding_side = 'left'
     
-    results = []
+    batches_processed = 0
     
-    for batch_idx, batch_prompts in device_batches:
+    # Process batches from queue until we get None (poison pill)
+    while True:
+        task = task_queue.get()
+        if task is None:
+            # Poison pill - time to exit
+            break
+        
+        batch_idx, batch_prompts = task
+        
         # Process this batch
         if common_args['use_prompt']:
             # Apply chat template if using Instruct model
@@ -574,13 +578,17 @@ def process_device_batches(args_dict):
 
         # Decode output for this batch
         batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-        results.append((batch_idx, batch_output, uncertainty_history))
+        
+        # Send result back
+        result_queue.put((batch_idx, batch_output, uncertainty_history))
+        batches_processed += 1
     
+    # Clean up
     del model
     if device != 'cpu':
         torch.cuda.empty_cache()
     
-    return results
+    return batches_processed
 
 
 def main():
@@ -758,17 +766,10 @@ def main():
         all_uncertainty_histories = []
         
         if use_parallel:
-            # Parallel processing across multiple GPUs
-            print(f"\nUsing parallel processing across {num_devices} GPUs...")
+            # Parallel processing across multiple GPUs with dynamic load balancing
+            print(f"\nUsing parallel processing across {num_devices} GPUs with dynamic load balancing...")
+            print(f"  → Model loaded ONCE per GPU, fast GPUs process more batches")
             
-            # Round-robin assign batches to devices but process sequentially per device to avoid overlapping models on the same GPU.
-            per_device_batches = {dev: [] for dev in devices}
-            for batch_idx in range(0, len(all_prompts), args.batch_size):
-                batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
-                device_idx = (batch_idx // args.batch_size) % num_devices
-                per_device_batches[devices[device_idx]].append((batch_idx // args.batch_size, batch_prompts))
-            
-            # Process batches in parallel
             # Use spawn method to avoid CUDA initialization issues
             try:
                 mp.set_start_method('spawn', force=True)
@@ -797,35 +798,51 @@ def main():
                 'weighted_entropy_lambda': args.weighted_entropy_lambda
             }
             
+            # Create shared queues for dynamic task distribution
+            task_queue = mp.Queue()
+            result_queue = mp.Queue()
+            
+            # Add all batches to the task queue
+            total_batches = 0
+            for batch_idx in range(0, len(all_prompts), args.batch_size):
+                batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
+                batch_num = batch_idx // args.batch_size
+                task_queue.put((batch_num, batch_prompts))
+                total_batches += 1
+            
+            # Add poison pills (None) to signal workers to exit
+            for _ in range(num_devices):
+                task_queue.put(None)
+            
+            # Start worker processes - one per GPU
+            workers = []
+            for device in devices:
+                p = mp.Process(
+                    target=gpu_worker,
+                    args=(device, task_queue, result_queue, common_args)
+                )
+                p.start()
+                workers.append(p)
+            
             try:
-                with ProcessPoolExecutor(max_workers=num_devices, initializer=worker_init) as executor:
-                    # Submit one job per device
-                    futures = {
-                        executor.submit(
-                            process_device_batches,
-                            {
-                                'device': device,
-                                'device_batches': per_device_batches[device],
-                                'common_args': common_args
-                            }
-                        ): device for device in devices if per_device_batches[device]
-                    }
+                # Collect results as they complete
+                results = {}
+                with tqdm(total=total_batches, desc="Processing batches") as pbar:
+                    for _ in range(total_batches):
+                        batch_idx, batch_output, uncertainty_history = result_queue.get()
+                        results[batch_idx] = (batch_output, uncertainty_history)
+                        pbar.update(1)
+                
+                # Wait for all workers to finish
+                for p in workers:
+                    p.join()
                     
-                    # Collect results as they complete
-                    results = {}
-                    with tqdm(total=len(futures), desc="Processing batches") as pbar:
-                        for future in as_completed(futures):
-                            try:
-                                batch_results = future.result()
-                                for batch_idx, batch_output, uncertainty_history in batch_results:
-                                    results[batch_idx] = (batch_output, uncertainty_history)
-                                pbar.update(1)
-                            except Exception as e:
-                                print(f"\nError processing device {futures[future]}: {e}")
-                                raise
             except KeyboardInterrupt:
                 print("\n\nInterrupted by user. Shutting down workers...")
-                executor.shutdown(wait=False, cancel_futures=True)
+                for p in workers:
+                    p.terminate()
+                for p in workers:
+                    p.join()
                 print("Cleanup complete. Exiting.")
                 sys.exit(1)
             
