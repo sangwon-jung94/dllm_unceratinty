@@ -16,24 +16,55 @@ from opencompass.datasets import MMLUDataset, MATHDataset, MATHEvaluator, AccEva
 from opencompass.models import LLaDAModel
 
 # MMLU 설정
-mmlu_reader_cfg = dict(input_columns=['input', 'A', 'B', 'C', 'D'], output_column='target')
-mmlu_infer_cfg = dict(
-    prompt_template=dict(
-        type=PromptTemplate,
-        template=dict(round=[
-            dict(role='HUMAN', prompt='{input}\nA. {A}\nB. {B}\nC. {C}\nD. {D}\nAnswer:'),
-        ])),
-    retriever=dict(type=ZeroRetriever),
-    inferencer=dict(type=GenInferencer, max_out_len=16))
-mmlu_eval_cfg = dict(evaluator=dict(type=AccEvaluator))
+mmlu_reader_cfg = dict(
+    input_columns=['input', 'A', 'B', 'C', 'D'], 
+    output_column='target',
+    train_split='dev',
+    test_split='test'
+)
 
-mmlu_datasets = [dict(
-    abbr='mmlu',
-    type=MMLUDataset,
-    path='opencompass/mmlu',
-    reader_cfg=mmlu_reader_cfg,
-    infer_cfg=mmlu_infer_cfg,
-    eval_cfg=mmlu_eval_cfg)]
+mmlu_all_sets = [
+    'college_biology', 'college_chemistry', 'college_computer_science',
+    'college_mathematics', 'college_physics', 'electrical_engineering',
+    'astronomy', 'anatomy', 'abstract_algebra', 'machine_learning',
+    'clinical_knowledge', 'global_facts', 'management', 'nutrition',
+    'marketing', 'professional_accounting', 'high_school_geography',
+    'international_law', 'moral_scenarios', 'computer_security',
+    'high_school_microeconomics', 'professional_law', 'medical_genetics',
+    'professional_psychology', 'jurisprudence', 'world_religions',
+    'philosophy', 'virology', 'high_school_chemistry', 'public_relations',
+    'high_school_macroeconomics', 'human_sexuality', 'elementary_mathematics',
+    'high_school_physics', 'high_school_computer_science',
+    'high_school_european_history', 'business_ethics', 'moral_disputes',
+    'high_school_statistics', 'miscellaneous', 'formal_logic',
+    'high_school_government_and_politics', 'prehistory', 'security_studies',
+    'high_school_biology', 'logical_fallacies', 'high_school_world_history',
+    'professional_medicine', 'high_school_mathematics', 'college_medicine',
+    'high_school_us_history', 'sociology', 'econometrics',
+    'high_school_psychology', 'human_aging', 'us_foreign_policy',
+    'conceptual_physics',
+]
+
+mmlu_datasets = []
+for _name in mmlu_all_sets:
+    mmlu_infer_cfg = dict(
+        prompt_template=dict(
+            type=PromptTemplate,
+            template=dict(round=[
+                dict(role='HUMAN', prompt='{input}\nA. {A}\nB. {B}\nC. {C}\nD. {D}\nAnswer:'),
+            ])),
+        retriever=dict(type=ZeroRetriever),
+        inferencer=dict(type=GenInferencer, max_out_len=16))
+    mmlu_eval_cfg = dict(evaluator=dict(type=AccEvaluator))
+    
+    mmlu_datasets.append(dict(
+        abbr=f'mmlu_{_name}',
+        type=MMLUDataset,
+        path='opencompass/mmlu',
+        name=_name,
+        reader_cfg=mmlu_reader_cfg,
+        infer_cfg=mmlu_infer_cfg,
+        eval_cfg=mmlu_eval_cfg))
 
 # MATH 설정
 math_reader_cfg = dict(input_columns=['problem'], output_column='solution')
@@ -60,12 +91,16 @@ datasets = mmlu_datasets + math_datasets
 MODEL_PATH = 'GSAI-ML/LLaDA-8B-Instruct'
 NUM_GPUS = 1
 
+# Data parallel: 각 worker가 서로 다른 GPU에서 독립적으로 실행
+# device_map='cuda:0' - OpenCompass가 각 worker에 CUDA_VISIBLE_DEVICES=N 설정하므로
+# cuda:0이 해당 worker에 할당된 GPU를 가리킴
 common_config = dict(
     type=LLaDAModel,
     path=MODEL_PATH,
     max_out_len=256,
     batch_size=1,
     run_cfg=dict(num_gpus=NUM_GPUS),
+    model_kwargs=dict(device_map='cuda:0', torch_dtype='torch.bfloat16'),
     gen_steps=256,
     gen_length=256,
     gen_blocksize=256,
@@ -87,7 +122,9 @@ from opencompass.partitioners import NumWorkerPartitioner
 from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLInferTask
 
+# num_worker=4: 4개 GPU 사용
+# max_num_workers=4: 동시에 최대 4개 작업 실행
 infer = dict(
     partitioner=dict(type=NumWorkerPartitioner, num_worker=4, num_split=None, min_task_size=16),
-    runner=dict(type=LocalRunner, max_num_workers=32, task=dict(type=OpenICLInferTask), retry=5),
+    runner=dict(type=LocalRunner, max_num_workers=4, task=dict(type=OpenICLInferTask), retry=5),
 )
