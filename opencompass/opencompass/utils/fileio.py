@@ -503,7 +503,11 @@ def extract_archive(from_path, to_path=None, remove_finished=False):
         raise ValueError(f'Extraction of {from_path} not supported')
 
     if remove_finished:
-        os.remove(from_path)
+        try:
+            os.remove(from_path)
+        except FileNotFoundError:
+            # File may have been removed by another parallel process
+            pass
 
 
 def download_and_extract_archive(url,
