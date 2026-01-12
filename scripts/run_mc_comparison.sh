@@ -16,7 +16,7 @@ for mc_samples in 2 4 8 16; do
         --mc_samples ${mc_samples}  --alpha 1.0 --beta 1.0  --dropout_p 0.1 \
         --use_mc_dropout_logit \
         --logits_eos_inf \
-        --device cuda:0 cuda:1 \
+        --device cuda:0 cuda:1 cuda:2 cuda:3 cuda:7 \
         --use_ensemble_model \
         --memory_efficient \
         --output_dir ./result \
@@ -26,6 +26,7 @@ for mc_samples in 2 4 8 16; do
     echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 done
 
+for mc_samples in 2 4 8 16; do
 for mc_samples in 2 4 8 16; do
     echo "- gsm8k_mc${mc_samples}/"
     start_time=$(date +%s)
@@ -41,7 +42,7 @@ for mc_samples in 2 4 8 16; do
         --mc_samples ${mc_samples}  --alpha 0.0 --beta 1.0  --dropout_p 0.1 \
         --use_mc_dropout_logit \
         --logits_eos_inf \
-        --device cuda:0 cuda:1 \
+        --device cuda:2 cuda:3 cuda:7 \
         --use_ensemble_model \
         --memory_efficient \
         --output_dir ./result \
@@ -51,6 +52,7 @@ for mc_samples in 2 4 8 16; do
     echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 done
 
+for mc_samples in 2 4 8 16; do
 for mc_samples in 2 4 8 16; do
     echo "- gsm8k_mc${mc_samples}/"
     start_time=$(date +%s)
