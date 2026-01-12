@@ -241,7 +241,8 @@ def compute_uncertainty_score(epistemic, aleatoric, alpha, beta):
 @ torch.no_grad()
 def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, block_length=128, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False, confidence_eos_eot_inf=False,
-             mc_samples=8, alpha=1.0, beta=1.0, dropout_p=None, topk_entropy_k_ratio=10, weighted_entropy_lambda=2.0):
+             mc_samples=8, alpha=1.0, beta=1.0, dropout_p=None, topk_entropy_k_ratio=10, weighted_entropy_lambda=2.0,
+             sample_from_clean_logits=False, memory_efficient=False):
     '''
     Args:
         model: Mask predictor.
@@ -251,7 +252,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
-        remasking: Remasking strategy. 'low_confidence', 'random', 'uncertainty_aware', 'topk_entropy', or 'weighted_entropy'.
+        remasking: Remasking strategy. 'low_confidence', 'random', 'uncertainty_aware', 'entropy', 'topk_entropy', or 'weighted_entropy'.
         mask_id: The token id of [MASK] is 126336.
         logits_eos_inf: Whether to set the logits of EOS token to -inf. See Appendix B.4 of LLaDA for details.
         confidence_eos_eot_inf: Whether to set the confidence of EOS and EoT token to -inf. See Appendix B.4 of LLaDA for details.
@@ -267,6 +268,11 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                               k = num_transfer_tokens * topk_entropy_k_ratio.
         weighted_entropy_lambda: Lambda for weighting top-1 entropy in 'weighted_entropy' remasking (default: 2.0).
                                  H = lambda * H(p1, 1-p1) + (1-p1) * H(p2, p3, ...).
+        sample_from_clean_logits: When True and using uncertainty_aware remasking, use uncertainty scores
+                                  for unmasking order but sample tokens from clean (non-dropout) logits.
+                                  This decouples the uncertainty-based ordering from the actual token selection.
+        memory_efficient: When True and using EnsembleLLaDA, uses generator mode to save GPU memory.
+                         Recommended for large models or limited GPU memory.
     '''
     # Check for dropout layers if using uncertainty-aware remasking
     if remasking == 'uncertainty_aware':
@@ -308,27 +314,53 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     cfg_scale=cfg_scale,
                     prompt_index=prompt_index,
                     mask_id=mask_id,
-                    dropout_p=dropout_p
+                    dropout_p=dropout_p,
+                    memory_efficient=memory_efficient
                 )
-                # Use mean probs (p_bar) instead of mean_logits for sampling
-                # p_bar is the average of softmax outputs, which is more principled
-                if logits_eos_inf:
-                    p_bar[:, :, 126081] = 0.0  # Zero out EOS probability
-
-                # Sample from mean probability distribution
-                if temperature == 0:
-                    x0 = torch.argmax(p_bar, dim=-1)
-                else:
-                    # Apply Gumbel noise to log probabilities
-                    log_p_bar = torch.log(p_bar + 1e-10)
-                    log_p_bar_with_noise = add_gumbel_noise(log_p_bar, temperature=temperature)
-                    x0 = torch.argmax(log_p_bar_with_noise, dim=-1)
-
-                # Compute unmasking score based on uncertainty
+                
+                # Compute unmasking score based on uncertainty (always from MC samples)
                 x0_p = compute_uncertainty_score(H_epistemic, H_aleatoric, alpha, beta)
+                
+                if sample_from_clean_logits:
+                    # Sample tokens from clean (non-dropout) logits
+                    # but use uncertainty scores for unmasking order
+                    if cfg_scale > 0.:
+                        un_x = x.clone()
+                        un_x[prompt_index] = mask_id
+                        x_ = torch.cat([x, un_x], dim=0)
+                        if attention_mask is not None:
+                            attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
+                            clean_logits = model(x_, attention_mask=attention_mask_).logits
+                        else:
+                            clean_logits = model(x_).logits
+                        clean_logits, un_logits = torch.chunk(clean_logits, 2, dim=0)
+                        clean_logits = un_logits + (cfg_scale + 1) * (clean_logits - un_logits)
+                    else:
+                        if attention_mask is not None:
+                            clean_logits = model(x, attention_mask=attention_mask).logits
+                        else:
+                            clean_logits = model(x).logits
+                    
+                    if logits_eos_inf:
+                        clean_logits[:, :, 126081] = -torch.inf
+                    
+                    logits_with_noise = add_gumbel_noise(clean_logits, temperature=temperature)
+                    x0 = torch.argmax(logits_with_noise, dim=-1)
+                else:
+                    # Sample from mean probability distribution (original behavior)
+                    if logits_eos_inf:
+                        p_bar[:, :, 126081] = 0.0  # Zero out EOS probability
+
+                    if temperature == 0:
+                        x0 = torch.argmax(p_bar, dim=-1)
+                    else:
+                        # Apply Gumbel noise to log probabilities
+                        log_p_bar = torch.log(p_bar + 1e-10)
+                        log_p_bar_with_noise = add_gumbel_noise(log_p_bar, temperature=temperature)
+                        x0 = torch.argmax(log_p_bar_with_noise, dim=-1)
 
             else:
-                # Original single-pass logic for 'low_confidence' and 'random'
+                # Original single-pass logic for 'low_confidence', 'random', 'entropy', etc.
                 if cfg_scale > 0.:
                     un_x = x.clone()
                     un_x[prompt_index] = mask_id
