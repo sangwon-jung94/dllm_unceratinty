@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, AutoModel
 from generate import (
     add_gumbel_noise,
@@ -21,6 +22,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
 
+# Special token IDs to exclude from sampling order tracking
+EOS_TOKEN_ID = 126081
+EOT_TOKEN_ID = 126348
+SPECIAL_TOKEN_IDS = {EOS_TOKEN_ID, EOT_TOKEN_ID}
+
+
 @torch.no_grad()
 def generate_simple(
     model, 
@@ -38,13 +45,18 @@ def generate_simple(
     dropout_p=None,
     topk_entropy_k_ratio=10,
     weighted_entropy_lambda=2.0,
+    track_sampling_order=False,
 ):
     '''
     Generate text without uncertainty tracking.
     Supports 'low_confidence', 'random', 'entropy', 'topk_entropy', and 'weighted_entropy' remasking.
     
+    Args:
+        track_sampling_order: If True, track which positions are unmasked at each step
+    
     Returns:
         x: Generated sequences
+        sampling_history: (optional) Dict containing sampling order info if track_sampling_order=True
     '''
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -64,13 +76,21 @@ def generate_simple(
     steps_per_block = steps // num_blocks
 
     global_step = 0
+    
+    # Initialize sampling order tracking
+    if track_sampling_order:
+        sampling_history = {
+            'steps': [],  # step index
+            'positions': [],  # list of unmasked positions at each step (relative to gen_length start)
+            'token_ids': [],  # token IDs that were sampled at each position
+        }
     if dropout_p is not None:
         enable_mc_dropout(model, p=dropout_p)
-    for num_block in range(num_blocks):
+    for num_block in tqdm(range(num_blocks), desc="Blocks", position=0, leave=True):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
-        for i in tqdm(range(steps_per_block), desc=f"Block {num_block+1}/{num_blocks} steps", leave=False):
+        for i in tqdm(range(steps_per_block), desc=f"Block {num_block+1}/{num_blocks} steps", leave=False, position=1):
             mask_index = (x == mask_id)
             
             if cfg_scale > 0:
@@ -179,11 +199,179 @@ def generate_simple(
                 transfer_index[batch_indices[valid_mask], topk_indices[valid_mask]] = True
             
             x[transfer_index] = x0[transfer_index]
+            
+            # Track sampling order (only for regular tokens, excluding EOS/EOT)
+            # Optimized: Use tensor operations instead of Python loops to avoid GPU->CPU transfers
+            if track_sampling_order:
+                prompt_len = prompt.shape[1]
+                # Get generation region only
+                gen_transfer = transfer_index[:, prompt_len:]  # [batch, gen_length]
+                gen_tokens = x0[:, prompt_len:]  # [batch, gen_length]
+                
+                # Create mask for non-special tokens (vectorized)
+                non_special_mask = gen_transfer.clone()
+                for special_id in SPECIAL_TOKEN_IDS:
+                    non_special_mask &= (gen_tokens != special_id)
+                
+                # Get positions and token_ids using tensor operations (single GPU->CPU transfer)
+                if non_special_mask.any():
+                    # For each batch, get the positions (already relative to gen start)
+                    batch_indices_track, pos_indices = torch.where(non_special_mask)
+                    token_ids_at_pos = gen_tokens[batch_indices_track, pos_indices]
+                    
+                    # Single CPU transfer at the end
+                    batch_np = batch_indices_track.cpu().numpy()
+                    pos_np = pos_indices.cpu().numpy()
+                    tok_np = token_ids_at_pos.cpu().numpy()
+                    
+                    # Group by batch (usually batch_size=1, so this is fast)
+                    for b in range(x.shape[0]):
+                        b_mask = (batch_np == b)
+                        if b_mask.any():
+                            sampling_history['steps'].append(global_step)
+                            sampling_history['positions'].append(pos_np[b_mask].tolist())
+                            sampling_history['token_ids'].append(tok_np[b_mask].tolist())
+            
             global_step += 1
     if dropout_p is not None:
         disable_mc_dropout(model)
 
+    if track_sampling_order:
+        return x, sampling_history
     return x
+
+
+def plot_sampling_order(sampling_history, save_path='sampling_order.png', title_suffix='', gen_length=128):
+    '''
+    Plot sampling order as a bar chart.
+    X-axis: sampling step, Y-axis: token positions unmasked at each step.
+    
+    Args:
+        sampling_history: Dict with 'steps', 'positions', 'token_ids'
+        save_path: Path to save the plot
+        title_suffix: Additional text to add to the title
+        gen_length: Total generation length for y-axis limit
+    '''
+    import matplotlib.pyplot as plt
+    
+    if not sampling_history['steps']:
+        print("Warning: No sampling history to plot (all tokens may be special tokens)")
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    steps = sampling_history['steps']
+    positions = sampling_history['positions']
+    
+    # Flatten data for scatter plot style bar chart
+    all_steps = []
+    all_positions = []
+    
+    for step, pos_list in zip(steps, positions):
+        for pos in pos_list:
+            all_steps.append(step)
+            all_positions.append(pos)
+    
+    if not all_steps:
+        print("Warning: No regular tokens to plot")
+        return
+    
+    # Create bar chart: for each step, show which positions were unmasked
+    # Use scatter plot with vertical lines for better visualization
+    unique_steps = sorted(set(all_steps))
+    
+    # Group positions by step
+    step_to_positions = {}
+    for step, pos in zip(all_steps, all_positions):
+        if step not in step_to_positions:
+            step_to_positions[step] = []
+        step_to_positions[step].append(pos)
+    
+    # Plot bars for each position at each step
+    bar_width = 0.8
+    colors = plt.cm.viridis(np.linspace(0, 1, len(unique_steps)))
+    
+    for idx, step in enumerate(unique_steps):
+        positions_at_step = step_to_positions.get(step, [])
+        for pos in positions_at_step:
+            ax.bar(step, 1, bottom=pos, width=bar_width, color=colors[idx % len(colors)], 
+                   edgecolor='white', linewidth=0.5, alpha=0.8)
+    
+    ax.set_xlabel('Sampling Step', fontsize=12)
+    ax.set_ylabel('Token Position (relative to generation start)', fontsize=12)
+    title = 'Token Sampling Order\n(Which positions are unmasked at each step)'
+    if title_suffix:
+        title += f'\n{title_suffix}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_ylim(0, gen_length)
+    ax.set_xlim(-0.5, max(steps) + 0.5)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add colorbar to show step progression
+    sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=min(unique_steps), vmax=max(unique_steps)))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, label='Sampling Step')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Sampling order plot saved to: {save_path}")
+    plt.close()
+
+
+def plot_sampling_order_scatter(sampling_history, save_path='sampling_order_scatter.png', title_suffix='', gen_length=128):
+    '''
+    Plot sampling order as a scatter plot for cleaner visualization.
+    X-axis: sampling step, Y-axis: token positions unmasked at each step.
+    
+    Args:
+        sampling_history: Dict with 'steps', 'positions', 'token_ids'
+        save_path: Path to save the plot
+        title_suffix: Additional text to add to the title
+        gen_length: Total generation length for y-axis limit
+    '''
+    if not sampling_history['steps']:
+        print("Warning: No sampling history to plot (all tokens may be special tokens)")
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    steps = sampling_history['steps']
+    positions = sampling_history['positions']
+    
+    # Flatten data
+    all_steps = []
+    all_positions = []
+    
+    for step, pos_list in zip(steps, positions):
+        for pos in pos_list:
+            all_steps.append(step)
+            all_positions.append(pos)
+    
+    if not all_steps:
+        print("Warning: No regular tokens to plot")
+        return
+    
+    # Scatter plot with color representing step
+    scatter = ax.scatter(all_steps, all_positions, c=all_steps, cmap='viridis', 
+                         s=50, alpha=0.7, edgecolors='white', linewidths=0.5)
+    
+    ax.set_xlabel('Sampling Step', fontsize=12)
+    ax.set_ylabel('Token Position (relative to generation start)', fontsize=12)
+    title = 'Token Sampling Order (Scatter)\n(Which positions are unmasked at each step)'
+    if title_suffix:
+        title += f'\n{title_suffix}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_ylim(-1, gen_length)
+    ax.set_xlim(-0.5, max(all_steps) + 0.5)
+    ax.grid(True, alpha=0.3)
+    
+    # Add colorbar
+    cbar = plt.colorbar(scatter, ax=ax, label='Sampling Step')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Sampling order scatter plot saved to: {save_path}")
+    plt.close()
 
 
 def get_benchmark_prompts(benchmark_name, num_samples=None):
@@ -216,7 +404,10 @@ def get_benchmark_prompts(benchmark_name, num_samples=None):
         num_to_use = len(dataset) if num_samples is None else min(num_samples, len(dataset))
         for item in dataset.select(range(num_to_use)):
             sentence = item['sentence']
-            prompts.append(sentence)
+            option1 = item['option1']
+            option2 = item['option2']
+            prompt = f"{sentence}\n\n1) {option1}\n2) {option2}"
+            prompts.append(prompt)
     
     elif benchmark_name == 'arc_easy':
         dataset = load_dataset('ai2_arc', 'ARC-Easy', split='test')
@@ -287,7 +478,7 @@ def process_device_batches(args_dict):
         input_ids = encoded_outputs['input_ids'].to(device)
         attention_mask = encoded_outputs['attention_mask'].to(device)
 
-        out = generate_simple(
+        result = generate_simple(
             model=model,
             prompt=input_ids,
             attention_mask=attention_mask,
@@ -302,10 +493,17 @@ def process_device_batches(args_dict):
             dropout_p=common_args['dropout_p'],
             topk_entropy_k_ratio=common_args['topk_entropy_k_ratio'],
             weighted_entropy_lambda=common_args['weighted_entropy_lambda'],
+            track_sampling_order=common_args.get('track_sampling_order', False),
         )
+        
+        if common_args.get('track_sampling_order', False):
+            out, sampling_history = result
+        else:
+            out = result
+            sampling_history = None
 
         batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-        results.append((batch_idx, batch_output))
+        results.append((batch_idx, batch_output, sampling_history))
 
     del model
     if device != 'cpu':
@@ -374,6 +572,10 @@ def main():
                         help='Directory to save outputs')
     parser.add_argument('--exp_name', type=str, default=None,
                         help='Experiment name (used for output filenames)')
+    
+    # Sampling order tracking
+    parser.add_argument('--track_sampling_order', action='store_true',
+                        help='Track and visualize which token positions are unmasked at each step')
     
     args = parser.parse_args()
     
@@ -492,9 +694,11 @@ def main():
                 'dropout_p': args.dropout_p,
                 'use_ensemble_model': args.use_ensemble_model,
                 'topk_entropy_k_ratio': args.topk_entropy_k_ratio,
-                'weighted_entropy_lambda': args.weighted_entropy_lambda
+                'weighted_entropy_lambda': args.weighted_entropy_lambda,
+                'track_sampling_order': args.track_sampling_order
             }
 
+            all_sampling_histories = []
             try:
                 with ProcessPoolExecutor(max_workers=num_devices) as executor:
                     futures = {
@@ -509,12 +713,15 @@ def main():
                     }
 
                     results = {}
+                    sampling_results = {}
                     with tqdm(total=len(futures), desc="Processing batches") as pbar:
                         for future in as_completed(futures):
                             try:
                                 batch_results = future.result()
-                                for batch_idx, batch_output in batch_results:
+                                for batch_idx, batch_output, sampling_history in batch_results:
                                     results[batch_idx] = batch_output
+                                    if sampling_history:
+                                        sampling_results[batch_idx] = sampling_history
                                 pbar.update(1)
                             except Exception as e:
                                 print(f"\nError processing device {futures[future]}: {e}")
@@ -527,9 +734,15 @@ def main():
 
             for batch_idx in sorted(results.keys()):
                 all_outputs.extend(results[batch_idx])
+            
+            # Aggregate sampling histories from parallel processing
+            if args.track_sampling_order:
+                for batch_idx in sorted(sampling_results.keys()):
+                    all_sampling_histories.append(sampling_results[batch_idx])
 
         else:
-            with tqdm(total=num_batches, desc="Batch", position=0, leave=True) as batch_pbar:
+            all_sampling_histories = []
+            with tqdm(total=num_batches, desc="Batches", position=0, leave=True) as batch_pbar:
                 for batch_idx in range(0, len(all_prompts), args.batch_size):
                     batch_prompts = all_prompts[batch_idx:batch_idx + args.batch_size]
 
@@ -550,7 +763,7 @@ def main():
                     attention_mask = encoded_outputs['attention_mask'].to(device)
 
                     # Generate
-                    out = generate_simple(
+                    result = generate_simple(
                         model=model,
                         prompt=input_ids,
                         attention_mask=attention_mask,
@@ -565,7 +778,14 @@ def main():
                         dropout_p=args.dropout_p,
                         topk_entropy_k_ratio=args.topk_entropy_k_ratio,
                         weighted_entropy_lambda=args.weighted_entropy_lambda,
+                        track_sampling_order=args.track_sampling_order,
                     )
+                    
+                    if args.track_sampling_order:
+                        out, sampling_history = result
+                        all_sampling_histories.append(sampling_history)
+                    else:
+                        out = result
 
                     # Decode output for this batch
                     batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
@@ -574,6 +794,21 @@ def main():
         
         output = all_outputs
         original_prompts = all_prompts
+        
+        # Merge all sampling histories if tracking
+        if args.track_sampling_order and all_sampling_histories:
+            merged_sampling_history = {
+                'steps': [],
+                'positions': [],
+                'token_ids': []
+            }
+            for hist in all_sampling_histories:
+                merged_sampling_history['steps'].extend(hist['steps'])
+                merged_sampling_history['positions'].extend(hist['positions'])
+                merged_sampling_history['token_ids'].extend(hist['token_ids'])
+            sampling_history = merged_sampling_history
+        else:
+            sampling_history = None
         
         print(f"\nFirst prompt example: {all_prompts[0][:100]}...")
     else:
@@ -633,7 +868,7 @@ def main():
         print("\nGenerating...")
         
         # Generate
-        out = generate_simple(
+        result = generate_simple(
             model=model,
             prompt=input_ids,
             attention_mask=attention_mask,
@@ -648,7 +883,14 @@ def main():
             dropout_p=args.dropout_p,
             topk_entropy_k_ratio=args.topk_entropy_k_ratio,
             weighted_entropy_lambda=args.weighted_entropy_lambda,
+            track_sampling_order=args.track_sampling_order,
         )
+        
+        if args.track_sampling_order:
+            out, sampling_history = result
+        else:
+            out = result
+            sampling_history = None
         
         # Decode output
         output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
@@ -721,10 +963,35 @@ def main():
             sample_data['prompt'] = original_prompts[i]
         evaluation_data['samples'].append(sample_data)
     
-    json_output_path = os.path.join(exp_output_dir, 'evaluation.json')
+    json_output_path = os.path.join(exp_output_dir, 'results.json')
     with open(json_output_path, 'w') as f:
         json.dump(evaluation_data, f, indent=2)
     print(f"Evaluation data saved to: {json_output_path}")
+    
+    # Save and visualize sampling order if tracking
+    if args.track_sampling_order and sampling_history:
+        # Save sampling order data
+        sampling_data_path = os.path.join(exp_output_dir, 'sampling_order.npz')
+        # Convert lists of lists to object arrays for saving
+        np.savez(
+            sampling_data_path,
+            steps=np.array(sampling_history['steps']),
+            positions=np.array(sampling_history['positions'], dtype=object),
+            token_ids=np.array(sampling_history['token_ids'], dtype=object)
+        )
+        print(f"Sampling order data saved to: {sampling_data_path}")
+        
+        # Create visualizations
+        print("\nCreating sampling order visualizations...")
+        title_suffix = f"Remasking: {args.remasking}"
+        
+        # Bar chart style plot
+        plot_path = os.path.join(exp_output_dir, 'sampling_order.png')
+        plot_sampling_order(sampling_history, plot_path, title_suffix, args.gen_length)
+        
+        # Scatter plot style
+        scatter_plot_path = os.path.join(exp_output_dir, 'sampling_order_scatter.png')
+        plot_sampling_order_scatter(sampling_history, scatter_plot_path, title_suffix, args.gen_length)
     
     print("\n" + "=" * 80)
     print("All outputs saved to:", exp_output_dir)

@@ -28,6 +28,12 @@ from models.EnsembleLLaDA import get_ensemble_model
 from generate import is_ensemble_model
 
 
+# Special token IDs to exclude from sampling order tracking
+EOS_TOKEN_ID = 126081
+EOT_TOKEN_ID = 126348
+SPECIAL_TOKEN_IDS = {EOS_TOKEN_ID, EOT_TOKEN_ID}
+
+
 def compute_entropy(p, dim=-1):
     """
     Compute entropy of probability distribution.
@@ -235,17 +241,24 @@ def generate_with_single_sample_remasking(
     use_single_sample_for_remasking=True,
     use_single_sample_for_sampling=False,
     topk_entropy_k_ratio=10,
-    weighted_entropy_lambda=2.0
+    weighted_entropy_lambda=2.0,
+    track_sampling_order=False
 ):
     '''
     실험용 생성 함수:
     - 샘플링: 기본은 앙상블 평균, 옵션으로 단일 샘플 로짓 사용
     - Remasking: 기본은 단일 샘플 로짓, 옵션으로 앙상블 사용
     
+    Args:
+        track_sampling_order: If True, track which positions are unmasked at each step
+    
     Returns:
         x: Generated sequences
         uncertainty_history: Dict containing timestep-wise uncertainty metrics
+        sampling_history: (optional) Dict containing sampling order info if track_sampling_order=True
     '''
+    from tqdm import tqdm
+    
     uncertainty_history = {
         'timesteps': [],
         'mean_epistemic': [],
@@ -262,6 +275,14 @@ def generate_with_single_sample_remasking(
         'std_aleatoric_unmasked': [],
         'std_total_unmasked': [],
     }
+    
+    # Initialize sampling order tracking
+    if track_sampling_order:
+        sampling_history = {
+            'steps': [],
+            'positions': [],
+            'token_ids': []
+        }
     
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -282,7 +303,7 @@ def generate_with_single_sample_remasking(
 
     global_step = 0
     
-    for num_block in range(num_blocks):
+    for num_block in tqdm(range(num_blocks), desc="Blocks", position=0, leave=True):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
@@ -437,8 +458,37 @@ def generate_with_single_sample_remasking(
                 uncertainty_history['std_total_unmasked'].append(0.0)
             
             x[transfer_index] = x0[transfer_index]
+            
+            # Track sampling order (only for regular tokens, excluding EOS/EOT)
+            # Optimized: Use tensor operations instead of Python loops
+            if track_sampling_order:
+                prompt_len = prompt.shape[1]
+                gen_transfer = transfer_index[:, prompt_len:]
+                gen_tokens = x0[:, prompt_len:]
+                
+                non_special_mask = gen_transfer.clone()
+                for special_id in SPECIAL_TOKEN_IDS:
+                    non_special_mask &= (gen_tokens != special_id)
+                
+                if non_special_mask.any():
+                    batch_indices_track, pos_indices = torch.where(non_special_mask)
+                    token_ids_at_pos = gen_tokens[batch_indices_track, pos_indices]
+                    
+                    batch_np = batch_indices_track.cpu().numpy()
+                    pos_np = pos_indices.cpu().numpy()
+                    tok_np = token_ids_at_pos.cpu().numpy()
+                    
+                    for b in range(x.shape[0]):
+                        b_mask = (batch_np == b)
+                        if b_mask.any():
+                            sampling_history['steps'].append(global_step)
+                            sampling_history['positions'].append(pos_np[b_mask].tolist())
+                            sampling_history['token_ids'].append(tok_np[b_mask].tolist())
+            
             global_step += 1
 
+    if track_sampling_order:
+        return x, uncertainty_history, sampling_history
     return x, uncertainty_history
 
 
@@ -487,6 +537,109 @@ def plot_uncertainty_over_time(uncertainty_history, save_path='uncertainty_over_
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to: {save_path}")
+    plt.close()
+
+
+def plot_sampling_order(sampling_history, save_path='sampling_order.png', title_suffix='', gen_length=128):
+    '''Plot sampling order as a bar chart.'''
+    if not sampling_history['steps']:
+        print("Warning: No sampling history to plot (all tokens may be special tokens)")
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    steps = sampling_history['steps']
+    positions = sampling_history['positions']
+    
+    all_steps = []
+    all_positions = []
+    
+    for step, pos_list in zip(steps, positions):
+        for pos in pos_list:
+            all_steps.append(step)
+            all_positions.append(pos)
+    
+    if not all_steps:
+        print("Warning: No regular tokens to plot")
+        return
+    
+    unique_steps = sorted(set(all_steps))
+    step_to_positions = {}
+    for step, pos in zip(all_steps, all_positions):
+        if step not in step_to_positions:
+            step_to_positions[step] = []
+        step_to_positions[step].append(pos)
+    
+    bar_width = 0.8
+    colors = plt.cm.viridis(np.linspace(0, 1, len(unique_steps)))
+    
+    for idx, step in enumerate(unique_steps):
+        positions_at_step = step_to_positions.get(step, [])
+        for pos in positions_at_step:
+            ax.bar(step, 1, bottom=pos, width=bar_width, color=colors[idx % len(colors)], 
+                   edgecolor='white', linewidth=0.5, alpha=0.8)
+    
+    ax.set_xlabel('Sampling Step', fontsize=12)
+    ax.set_ylabel('Token Position (relative to generation start)', fontsize=12)
+    title = 'Token Sampling Order\n(Which positions are unmasked at each step)'
+    if title_suffix:
+        title += f'\n{title_suffix}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_ylim(0, gen_length)
+    ax.set_xlim(-0.5, max(steps) + 0.5)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=min(unique_steps), vmax=max(unique_steps)))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, label='Sampling Step')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Sampling order plot saved to: {save_path}")
+    plt.close()
+
+
+def plot_sampling_order_scatter(sampling_history, save_path='sampling_order_scatter.png', title_suffix='', gen_length=128):
+    '''Plot sampling order as a scatter plot.'''
+    if not sampling_history['steps']:
+        print("Warning: No sampling history to plot (all tokens may be special tokens)")
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    steps = sampling_history['steps']
+    positions = sampling_history['positions']
+    
+    all_steps = []
+    all_positions = []
+    
+    for step, pos_list in zip(steps, positions):
+        for pos in pos_list:
+            all_steps.append(step)
+            all_positions.append(pos)
+    
+    if not all_steps:
+        print("Warning: No regular tokens to plot")
+        return
+    
+    scatter = ax.scatter(all_steps, all_positions, c=all_steps, cmap='viridis', 
+                         s=50, alpha=0.7, edgecolors='white', linewidths=0.5)
+    
+    ax.set_xlabel('Sampling Step', fontsize=12)
+    ax.set_ylabel('Token Position (relative to generation start)', fontsize=12)
+    title = 'Token Sampling Order (Scatter)\n(Which positions are unmasked at each step)'
+    if title_suffix:
+        title += f'\n{title_suffix}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_ylim(-1, gen_length)
+    ax.set_xlim(-0.5, max(all_steps) + 0.5)
+    ax.grid(True, alpha=0.3)
+    
+    cbar = plt.colorbar(scatter, ax=ax, label='Sampling Step')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Sampling order scatter plot saved to: {save_path}")
     plt.close()
 
 
@@ -543,7 +696,7 @@ def process_device_batches(args_dict):
         input_ids = encoded_outputs['input_ids'].to(device)
         attention_mask = encoded_outputs['attention_mask'].to(device)
 
-        out, uncertainty_history = generate_with_single_sample_remasking(
+        result = generate_with_single_sample_remasking(
             model=model,
             prompt=input_ids,
             attention_mask=attention_mask,
@@ -563,11 +716,19 @@ def process_device_batches(args_dict):
             use_single_sample_for_remasking=common_args['use_single_sample_for_remasking'],
             use_single_sample_for_sampling=common_args['use_single_sample_for_sampling'],
             topk_entropy_k_ratio=common_args['topk_entropy_k_ratio'],
-            weighted_entropy_lambda=common_args['weighted_entropy_lambda']
+            weighted_entropy_lambda=common_args['weighted_entropy_lambda'],
+            track_sampling_order=common_args.get('track_sampling_order', False)
         )
 
-        batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-        results.append((batch_idx, batch_output, uncertainty_history))
+        # Handle return value based on track_sampling_order
+        if common_args.get('track_sampling_order', False):
+            out, uncertainty_history, sampling_history = result
+            batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+            results.append((batch_idx, batch_output, uncertainty_history, sampling_history))
+        else:
+            out, uncertainty_history = result
+            batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+            results.append((batch_idx, batch_output, uncertainty_history, None))
 
     del model
     if device != 'cpu':
@@ -584,6 +745,15 @@ def get_benchmark_prompts(benchmark_name, num_samples=None):
         dataset = load_dataset('gsm8k', 'main', split='test')
         num_to_use = len(dataset) if num_samples is None else min(num_samples, len(dataset))
         prompts = [item['question'] for item in dataset.select(range(num_to_use))]
+    elif benchmark_name == 'winogrande':
+        dataset = load_dataset('winogrande', 'winogrande_xl', split='validation')
+        num_to_use = len(dataset) if num_samples is None else min(num_samples, len(dataset))
+        for item in dataset.select(range(num_to_use)):
+            sentence = item['sentence']
+            option1 = item['option1']
+            option2 = item['option2']
+            prompt = f"{sentence}\n\n1) {option1}\n2) {option2}"
+            prompts.append(prompt)
     else:
         raise ValueError(f"Unknown benchmark: {benchmark_name}")
 
@@ -666,7 +836,7 @@ def main():
     parser.add_argument('--use_prompt', action='store_true',
                         help='Use benchmark/custom prompts instead of repeating --prompt')
     parser.add_argument('--benchmark', type=str, default='gsm8k',
-                        choices=['gsm8k', 'custom'],
+                        choices=['gsm8k', 'winogrande', 'custom'],
                         help='Benchmark name when --use_prompt is set')
     parser.add_argument('--custom_prompt', type=str, default=None,
                         help='Custom prompt text when benchmark=custom')
@@ -676,6 +846,8 @@ def main():
                         help='Directory to save outputs')
     parser.add_argument('--exp_name', type=str, default=None,
                         help='Experiment name')
+    parser.add_argument('--track_sampling_order', action='store_true',
+                        help='Track which positions are unmasked at each timestep (excluding EOS/EOT)')
     
     args = parser.parse_args()
     
@@ -747,6 +919,7 @@ def main():
 
     all_outputs = []
     all_uncertainty_histories = []
+    all_sampling_histories = []
 
     if use_parallel:
         print(f"Using parallel processing across {num_devices} devices...\n")
@@ -782,7 +955,8 @@ def main():
             'use_ensemble_model': args.use_ensemble_model,
             'mask_id': 126336,
             'topk_entropy_k_ratio': args.topk_entropy_k_ratio,
-            'weighted_entropy_lambda': args.weighted_entropy_lambda
+            'weighted_entropy_lambda': args.weighted_entropy_lambda,
+            'track_sampling_order': args.track_sampling_order
         }
 
         executor = None
@@ -804,8 +978,8 @@ def main():
                     for future in as_completed(futures):
                         try:
                             batch_results = future.result()
-                            for batch_idx, batch_output, uncertainty_history in batch_results:
-                                results[batch_idx] = (batch_output, uncertainty_history)
+                            for batch_idx, batch_output, uncertainty_history, sampling_history in batch_results:
+                                results[batch_idx] = (batch_output, uncertainty_history, sampling_history)
                             pbar.update(1)
                         except Exception as e:
                             print(f"\n\n[!] Error processing device {futures[future]}: {e}")
@@ -836,9 +1010,11 @@ def main():
             sys.exit(0)
 
         for batch_idx in sorted(results.keys()):
-            batch_output, uncertainty_history = results[batch_idx]
+            batch_output, uncertainty_history, sampling_history = results[batch_idx]
             all_outputs.extend(batch_output)
             all_uncertainty_histories.append(uncertainty_history)
+            if sampling_history is not None:
+                all_sampling_histories.append(sampling_history)
 
     else:
         device = devices[0]
@@ -864,7 +1040,7 @@ def main():
         if tokenizer.padding_side != 'left':
             tokenizer.padding_side = 'left'
 
-        with tqdm(total=num_batches, desc="Processing batches", position=0, leave=True) as batch_pbar:
+        with tqdm(total=num_batches, desc="Batches", position=0, leave=True) as batch_pbar:
             for batch_idx in range(0, len(all_prompts), batch_size):
                 batch_prompts = all_prompts[batch_idx:batch_idx + batch_size]
 
@@ -883,7 +1059,7 @@ def main():
                 input_ids = encoded_outputs['input_ids'].to(device)
                 attention_mask = encoded_outputs['attention_mask'].to(device)
 
-                out, uncertainty_history = generate_with_single_sample_remasking(
+                result = generate_with_single_sample_remasking(
                     model=model,
                     prompt=input_ids,
                     attention_mask=attention_mask,
@@ -902,8 +1078,16 @@ def main():
                     use_single_sample_for_remasking=args.use_single_sample_for_remasking,
                     use_single_sample_for_sampling=args.use_single_sample_for_sampling,
                     topk_entropy_k_ratio=args.topk_entropy_k_ratio,
-                    weighted_entropy_lambda=args.weighted_entropy_lambda
+                    weighted_entropy_lambda=args.weighted_entropy_lambda,
+                    track_sampling_order=args.track_sampling_order
                 )
+
+                # Handle return value based on track_sampling_order
+                if args.track_sampling_order:
+                    out, uncertainty_history, sampling_history = result
+                    all_sampling_histories.append(sampling_history)
+                else:
+                    out, uncertainty_history = result
 
                 batch_output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
                 all_outputs.extend(batch_output)
@@ -967,6 +1151,35 @@ def main():
     sampling_desc = 'Single Sample' if args.use_single_sample_for_sampling else 'Ensemble'
     title_suffix = f"Remasking: {args.remasking} ({remask_desc}) | Sampling: {sampling_desc}"
     plot_uncertainty_over_time(uncertainty_history, plot_path, title_suffix)
+    
+    # Save and visualize sampling order if tracked
+    if args.track_sampling_order and all_sampling_histories:
+        # Aggregate sampling histories from all batches
+        aggregated_sampling_history = {
+            'steps': [],
+            'positions': [],
+            'token_ids': []
+        }
+        for hist in all_sampling_histories:
+            aggregated_sampling_history['steps'].extend(hist['steps'])
+            aggregated_sampling_history['positions'].extend(hist['positions'])
+            aggregated_sampling_history['token_ids'].extend(hist['token_ids'])
+        
+        # Save sampling order data
+        sampling_order_path = os.path.join(exp_output_dir, 'sampling_order.npz')
+        np.savez(sampling_order_path,
+                 steps=np.array(aggregated_sampling_history['steps']),
+                 positions=np.array(aggregated_sampling_history['positions'], dtype=object),
+                 token_ids=np.array(aggregated_sampling_history['token_ids'], dtype=object))
+        print(f"Sampling order data saved to: {sampling_order_path}")
+        
+        # Create sampling order visualizations
+        print("\nCreating sampling order visualizations...")
+        sampling_plot_path = os.path.join(exp_output_dir, 'sampling_order.png')
+        plot_sampling_order(aggregated_sampling_history, sampling_plot_path, title_suffix, args.gen_length)
+        
+        sampling_scatter_path = os.path.join(exp_output_dir, 'sampling_order_scatter.png')
+        plot_sampling_order_scatter(aggregated_sampling_history, sampling_scatter_path, title_suffix, args.gen_length)
     
     print("\n" + "=" * 80)
     print(f"All outputs saved to: {exp_output_dir}")

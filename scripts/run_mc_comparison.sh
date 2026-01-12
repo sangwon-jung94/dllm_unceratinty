@@ -1,14 +1,14 @@
 #!/bin/bash
 # MC Dropout 샘플 수 변화에 따른 비교 실험
 
-for mc_samples in 2 4 8 16 32; do
+for mc_samples in 2 4 8 16; do
     echo "- gsm8k_mc${mc_samples}/"
     start_time=$(date +%s)
     python3 visualize_uncertainty_by_timestep.py \
         --use_prompt \
         --benchmark gsm8k \
         --batch_size 4 \
-        --num_samples 256 \
+        --num_samples 20000 \
         --steps 256 \
         --gen_length 256 \
         --block_length 256 \
@@ -26,14 +26,14 @@ for mc_samples in 2 4 8 16 32; do
     echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 done
 
-for mc_samples in 2 4 8 16 32; do
+for mc_samples in 2 4 8 16; do
     echo "- gsm8k_mc${mc_samples}/"
     start_time=$(date +%s)
     python3 visualize_uncertainty_by_timestep.py \
         --use_prompt \
         --benchmark gsm8k \
         --batch_size 4 \
-        --num_samples 256 \
+        --num_samples 20000 \
         --steps 256 \
         --gen_length 256 \
         --block_length 256 \
@@ -51,14 +51,14 @@ for mc_samples in 2 4 8 16 32; do
     echo "Elapsed time: ${elapsed} seconds ($(($elapsed / 60)) minutes)"
 done
 
-for mc_samples in 2 4 8 16 32; do
+for mc_samples in 2 4 8 16; do
     echo "- gsm8k_mc${mc_samples}/"
     start_time=$(date +%s)
     python3 visualize_uncertainty_by_timestep.py \
         --use_prompt \
         --benchmark gsm8k \
         --batch_size 4 \
-        --num_samples 256 \
+        --num_samples 20000 \
         --steps 256 \
         --gen_length 256 \
         --block_length 256 \
@@ -66,7 +66,7 @@ for mc_samples in 2 4 8 16 32; do
         --mc_samples ${mc_samples}  --alpha 1.0 --beta 0.0  --dropout_p 0.1 \
         --use_mc_dropout_logit \
         --logits_eos_inf \
-        --device cuda:0 cuda:1 \
+        --device cuda:5 cuda:6 cuda:7 \
         --use_ensemble_model \
         --memory_efficient \
         --output_dir ./result \
